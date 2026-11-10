@@ -59,13 +59,15 @@ class DevelopmentInspector:
             report.append("Node.js, npm, and Git are available.")
         if not web["npx"]["installed"]:
             report.append("npx is unavailable; npm normally provides it.")
-        if project and project["missing_dependencies"]:
+        if project and project["declared_dependencies"] and project["missing_dependencies"]:
             missing = ", ".join(
                 item["name"] for item in project["missing_dependencies"]
             )
             report.append("Project dependencies are not installed: " + missing)
-        if project and not project["missing_dependencies"]:
+        if project and project["declared_dependencies"] and not project["missing_dependencies"]:
             report.append("Declared project dependencies are present.")
+        if project and not project["declared_dependencies"]:
+            report.append("No project dependency declarations were found.")
         return {
             "scenario": "react_typescript",
             "status": "ready" if not missing_required else "needs_setup",

@@ -56,6 +56,7 @@ def build_default_registry():
                             "pnpm",
                             "typescript",
                             "vite",
+                            "all",
                         ],
                     }
                 },
@@ -65,7 +66,9 @@ def build_default_registry():
             risk_level="read_only",
             timeout_seconds=30,
         ),
-        lambda args: software_detector.detect(args.get("name")),
+        lambda args: software_detector.detect(
+            None if args.get("name") == "all" else args.get("name")
+        ),
     )
     registry.register(
         ToolContract(

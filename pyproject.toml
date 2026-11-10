@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "savva-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "Read-only system inspection and tool registry for SAVVA"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -15,3 +15,6 @@ savva = "savva.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["savva*"]
+
+[tool.setuptools.package-data]
+savva = ["web/*.html", "web/*.css", "web/*.js"]

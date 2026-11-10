@@ -34,11 +34,21 @@ def build_parser() -> argparse.ArgumentParser:
     tool_commands.add_parser("list", help="List registered tools without executing them.")
     inspect = tool_commands.add_parser("inspect", help="Show one tool contract.")
     inspect.add_argument("name", help="Registered tool name, for example system.summary.")
+
+    serve = commands.add_parser("serve", help="Start the local SAVVA web interface.")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8765)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if args.command == "serve":
+        from .server import serve
+
+        return serve(args.host, args.port)
+
     registry = build_default_registry()
 
     if args.command == "tools":

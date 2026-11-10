@@ -13,12 +13,15 @@ class Permission(StrEnum):
     """
 
     SYSTEM_READ = "system.read"
+    WORKSPACE_READ = "workspace.read"
     FILES_WRITE = "files.write"
     PACKAGES_INSTALL = "packages.install"
     PROCESS_EXECUTE = "process.execute"
 
 
-IMPLEMENTED_PERMISSIONS = frozenset({Permission.SYSTEM_READ})
+IMPLEMENTED_PERMISSIONS = frozenset(
+    {Permission.SYSTEM_READ, Permission.WORKSPACE_READ}
+)
 FUTURE_PERMISSIONS = frozenset(
     {
         Permission.FILES_WRITE,

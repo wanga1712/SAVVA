@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>SAVVA Agent</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">S</span>
+        <div>
+          <strong>SAVVA</strong>
+          <small>Local system agent</small>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <span id="connection-pill" class="pill status-loading">Connecting</span>
+        <button id="new-chat" class="button ghost" type="button">New chat</button>
+        <button id="open-settings" class="button ghost" type="button">Settings</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="chat-panel" aria-label="SAVVA chat">
+        <div id="messages" class="messages">
+          <article class="welcome-card">
+            <p class="eyebrow">READ-ONLY SYSTEM AGENT</p>
+            <h1>Проверю компьютер до того, как что-то менять.</h1>
+            <p>SAVVA выбирает зарегистрированные инструменты, запускает реальную
+              диагностику и показывает каждый вызов и результат.</p>
+            <button class="suggestion" type="button" data-prompt="SAVVA, я хочу создать сайт на React. Проверь мой компьютер и скажи, готово ли окружение">
+              Проверить окружение для React
+            </button>
+            <button class="suggestion" type="button" data-prompt="Покажи основную информацию о системе: процессор, память, GPU и диски">
+              Показать параметры компьютера
+            </button>
+          </article>
+        </div>
+
+        <form id="composer" class="composer">
+          <label class="sr-only" for="message-input">Сообщение</label>
+          <textarea id="message-input" rows="1" maxlength="8000"
+            placeholder="Спросите SAVVA о компьютере или проекте…"></textarea>
+          <button id="send-button" class="send-button" type="submit" aria-label="Отправить">
+            <span>Send</span>
+          </button>
+        </form>
+        <p class="composer-note">Инструменты работают только на чтение. Установка и
+          изменение файлов требуют будущего подтверждения.</p>
+      </section>
+
+      <aside class="inspector-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">TOOL REGISTRY</p>
+            <h2>Available tools</h2>
+          </div>
+          <span id="tool-count" class="count">0</span>
+        </div>
+        <div id="tool-list" class="tool-list"></div>
+        <div class="safety-card">
+          <strong>Safety boundary</strong>
+          <p>Workspace read-only. No shell execution. API key stays in the Python backend.</p>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <dialog id="settings-dialog" class="settings-dialog">
+    <form id="settings-form" method="dialog">
+      <div class="dialog-heading">
+        <div>
+          <p class="eyebrow">RUNTIME SETTINGS</p>
+          <h2>Provider and limits</h2>
+        </div>
+        <button class="icon-button" value="cancel" aria-label="Close" type="submit">×</button>
+      </div>
+
+      <div class="key-notice">
+        API key is read only from the backend environment variable
+        <code>OPENROUTER_API_KEY</code>. It is never returned to this page.
+        <span id="key-status"></span>
+      </div>
+
+      <div class="form-grid">
+        <label>Provider
+          <select name="provider" id="provider">
+            <option value="openrouter">OpenRouter</option>
+            <option value="ollama">Ollama (local-ready)</option>
+          </select>
+        </label>
+        <label>Model
+          <input name="model" id="model" maxlength="200" list="model-presets" required>
+          <datalist id="model-presets">
+            <option value="nvidia/nemotron-3.5-lightning:free">
+            <option value="thinkingmachines/inkling-2-small:free">
+            <option value="qwen/qwen3.5-9b">
+          </datalist>
+        </label>
+        <label class="span-2">Base URL
+          <input name="base_url" id="base_url" maxlength="500" required>
+        </label>
+        <label>Max output tokens
+          <input name="max_tokens" id="max_tokens" type="number" min="64" max="65536">
+        </label>
+        <label>Max tool steps
+          <input name="max_tool_steps" id="max_tool_steps" type="number" min="1" max="20">
+        </label>
+        <label>Max requests / session
+          <input name="max_requests_per_session" id="max_requests" type="number" min="1" max="100">
+        </label>
+        <label>Max request cost (USD)
+          <input name="max_request_cost_usd" id="max_request_cost" type="number" min="0" step="0.001">
+        </label>
+        <label>Max session cost (USD)
+          <input name="max_session_cost_usd" id="max_session_cost" type="number" min="0" step="0.001">
+        </label>
+        <label>Max duration (seconds)
+          <input name="max_duration_seconds" id="max_duration" type="number" min="5" max="600">
+        </label>
+        <label class="span-2">Safe workspace
+          <input name="workspace_root" id="workspace_root" maxlength="1000" required>
+        </label>
+      </div>
+      <p id="settings-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button class="button ghost" value="cancel" type="submit">Cancel</button>
+        <button id="save-settings" class="button primary" value="default" type="submit">Save settings</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>
