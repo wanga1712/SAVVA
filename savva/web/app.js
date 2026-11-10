@@ -2,6 +2,7 @@ const state = {
   sessionId: crypto.randomUUID(),
   busy: false,
   settings: null,
+  currentProposal: null,
 };
 
 const elements = {
@@ -17,11 +18,31 @@ const elements = {
   settingsForm: document.querySelector("#settings-form"),
   settingsError: document.querySelector("#settings-error"),
   keyStatus: document.querySelector("#key-status"),
+  toolsView: document.querySelector("#tools-view"),
+  projectsView: document.querySelector("#projects-view"),
+  tabTools: document.querySelector("#tab-tools"),
+  tabProjects: document.querySelector("#tab-projects"),
+  projectTree: document.querySelector("#project-tree"),
+  actionJournal: document.querySelector("#action-journal"),
+  fileDialog: document.querySelector("#file-dialog"),
+  fileDialogTitle: document.querySelector("#file-dialog-title"),
+  fileContent: document.querySelector("#file-content"),
+  proposalDialog: document.querySelector("#proposal-dialog"),
+  proposalTitle: document.querySelector("#proposal-title"),
+  proposalSummary: document.querySelector("#proposal-summary"),
+  proposalChanges: document.querySelector("#proposal-changes"),
+  proposalDiff: document.querySelector("#proposal-diff"),
+  proposalError: document.querySelector("#proposal-error"),
+  approveProposal: document.querySelector("#approve-proposal"),
+  rejectProposal: document.querySelector("#reject-proposal"),
 };
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "X-SAVVA-Request": "1",
+    },
     ...options,
   });
   const document = await response.json().catch(() => ({}));
@@ -148,6 +169,9 @@ function renderAgentResult(shell, result) {
     }
     if (event.type === "confirmation_required" || event.confirmation_required) {
       timeline.append(createConfirmation(event));
+    }
+    if (event.type === "proposal_ready" && event.proposal) {
+      timeline.append(createProposalCard(event.proposal));
     }
   }
 
@@ -319,14 +343,197 @@ function createConfirmation(event) {
   const card = document.createElement("div");
   card.className = "confirmation-card";
   const text = document.createElement("p");
-  text.textContent = "Это действие потребует явного подтверждения. Write-инструменты пока отключены.";
+  text.textContent = "Модель запросила запись. Проверьте точный diff и подтвердите операцию.";
+  card.append(text);
+  if (event.proposal) {
+    card.append(createReviewButton(event.proposal.proposal_id));
+  }
+  return card;
+}
+
+function createProposalCard(proposal) {
+  const card = document.createElement("div");
+  card.className = "proposal-card";
+  const copy = document.createElement("div");
+  const title = document.createElement("strong");
+  title.textContent = proposal.summary || "Project proposal";
+  const details = document.createElement("p");
+  details.textContent =
+    `${proposal.file_count} files · ${proposal.total_bytes} bytes · ` +
+    `fingerprint ${String(proposal.fingerprint || "").slice(0, 12)}…`;
+  copy.append(title, details);
+  card.append(copy, createReviewButton(proposal.proposal_id));
+  return card;
+}
+
+function createReviewButton(proposalId) {
   const button = document.createElement("button");
   button.type = "button";
-  button.className = "button ghost";
-  button.textContent = "Confirmation not available";
-  button.disabled = true;
-  card.append(text, button);
-  return card;
+  button.className = "button primary";
+  button.textContent = "Review diff";
+  button.addEventListener("click", () => openProposal(proposalId));
+  return button;
+}
+
+async function openProposal(proposalId) {
+  elements.proposalError.textContent = "";
+  try {
+    const result = await api(
+      `/api/proposals/${encodeURIComponent(proposalId)}?session_id=${encodeURIComponent(state.sessionId)}`,
+    );
+    state.currentProposal = result.proposal;
+    elements.proposalTitle.textContent = result.proposal.summary || "Review proposal";
+    elements.proposalSummary.textContent =
+      `${result.proposal.file_count} files, ${result.proposal.total_bytes} bytes. ` +
+      `This approval is one-time and bound to fingerprint ${result.proposal.fingerprint}.`;
+    elements.proposalChanges.replaceChildren();
+    for (const change of result.proposal.changes || []) {
+      const chip = document.createElement("span");
+      chip.className = `change-chip ${change.action}`;
+      chip.textContent = `${change.action}: ${change.path} (${change.size_bytes} B)`;
+      elements.proposalChanges.append(chip);
+    }
+    elements.proposalDiff.textContent = result.proposal.diff || "No diff available.";
+    elements.approveProposal.disabled = false;
+    elements.rejectProposal.disabled = false;
+    elements.proposalDialog.showModal();
+  } catch (error) {
+    appendSystemNotice(`${error.code}: ${error.message}`);
+  }
+}
+
+async function decideProposal(decision) {
+  if (!state.currentProposal) return;
+  elements.approveProposal.disabled = true;
+  elements.rejectProposal.disabled = true;
+  elements.proposalError.textContent = "";
+  try {
+    await api("/api/confirm", {
+      method: "POST",
+      body: JSON.stringify({
+        proposal_id: state.currentProposal.proposal_id,
+        confirmation_token: state.currentProposal.confirmation_token,
+        session_id: state.sessionId,
+        decision,
+      }),
+    });
+    elements.proposalDialog.close();
+    state.currentProposal = null;
+    appendSystemNotice(
+      decision === "approve"
+        ? "Files written after exact proposal approval."
+        : "Proposal rejected. No files were changed.",
+    );
+    await Promise.all([loadProjectTree(), loadActions()]);
+  } catch (error) {
+    elements.proposalError.textContent = `${error.code}: ${error.message}`;
+    elements.approveProposal.disabled = false;
+    elements.rejectProposal.disabled = false;
+  }
+}
+
+function appendSystemNotice(text) {
+  const notice = document.createElement("div");
+  notice.className = "usage-row";
+  notice.textContent = text;
+  elements.messages.append(notice);
+  scrollToBottom();
+}
+
+function showInspector(view) {
+  const projects = view === "projects";
+  elements.toolsView.classList.toggle("hidden", projects);
+  elements.projectsView.classList.toggle("hidden", !projects);
+  elements.tabTools.classList.toggle("active", !projects);
+  elements.tabProjects.classList.toggle("active", projects);
+  if (projects) {
+    loadProjectTree();
+    loadActions();
+  }
+}
+
+async function loadProjectTree() {
+  elements.projectTree.replaceChildren();
+  try {
+    const result = await api("/api/projects/tree?path=.");
+    if (!result.entries?.length) {
+      const empty = document.createElement("p");
+      empty.className = "muted-note";
+      empty.textContent = "Workspace is empty. Ask SAVVA to create a project.";
+      elements.projectTree.append(empty);
+      return;
+    }
+    for (const entry of result.entries) {
+      const item = document.createElement(entry.type === "file" ? "button" : "div");
+      item.className = "tree-item";
+      if (entry.type === "file") item.type = "button";
+      const depth = Math.max(0, entry.path.split("/").length - 1);
+      item.style.paddingLeft = `${8 + depth * 14}px`;
+      const icon = document.createElement("span");
+      icon.className = "tree-icon";
+      icon.textContent = entry.type === "directory" ? "▾" : "·";
+      const path = document.createElement("span");
+      path.textContent = entry.path.split("/").at(-1);
+      const size = document.createElement("span");
+      size.className = "tree-size";
+      size.textContent = entry.type === "file" ? `${entry.size_bytes} B` : "";
+      item.append(icon, path, size);
+      if (entry.type === "file") {
+        item.addEventListener("click", () => openFile(entry.path));
+      }
+      elements.projectTree.append(item);
+    }
+  } catch (error) {
+    const message = document.createElement("p");
+    message.className = "muted-note";
+    message.textContent = `${error.code}: ${error.message}`;
+    elements.projectTree.append(message);
+  }
+}
+
+async function openFile(path) {
+  elements.proposalError.textContent = "";
+  try {
+    const result = await api(`/api/files/content?path=${encodeURIComponent(path)}`);
+    elements.fileDialogTitle.textContent = result.path;
+    elements.fileContent.textContent = result.content;
+    elements.fileDialog.showModal();
+  } catch (error) {
+    appendSystemNotice(`${error.code}: ${error.message}`);
+  }
+}
+
+async function loadActions() {
+  elements.actionJournal.replaceChildren();
+  try {
+    const result = await api("/api/actions");
+    if (!result.actions?.length) {
+      const empty = document.createElement("p");
+      empty.className = "muted-note";
+      empty.textContent = "No agent actions yet.";
+      elements.actionJournal.append(empty);
+      return;
+    }
+    for (const action of result.actions.slice(-20).reverse()) {
+      const entry = document.createElement("article");
+      entry.className = "action-entry";
+      const title = document.createElement("strong");
+      title.textContent = `${action.action} · ${action.status}`;
+      const details = document.createElement("p");
+      details.textContent =
+        `${action.project_path || "."} · ${action.paths?.length || 0} files · ` +
+        `${action.message || ""}`;
+      const timestamp = document.createElement("time");
+      timestamp.textContent = new Date(action.timestamp_unix * 1000).toLocaleString();
+      entry.append(title, details, timestamp);
+      elements.actionJournal.append(entry);
+    }
+  } catch (error) {
+    const message = document.createElement("p");
+    message.className = "muted-note";
+    message.textContent = `${error.code}: ${error.message}`;
+    elements.actionJournal.append(message);
+  }
 }
 
 function scrollToBottom() {
@@ -440,6 +647,24 @@ document.querySelector("#new-chat").addEventListener("click", async () => {
   state.sessionId = crypto.randomUUID();
   elements.messages.replaceChildren();
   location.reload();
+});
+
+elements.tabTools.addEventListener("click", () => showInspector("tools"));
+elements.tabProjects.addEventListener("click", () => showInspector("projects"));
+document.querySelector("#open-projects").addEventListener("click", () => {
+  showInspector("projects");
+  document.querySelector(".inspector-panel").scrollIntoView({ behavior: "smooth" });
+});
+document.querySelector("#refresh-projects").addEventListener("click", loadProjectTree);
+document.querySelector("#refresh-actions").addEventListener("click", loadActions);
+elements.approveProposal.addEventListener("click", () => decideProposal("approve"));
+elements.rejectProposal.addEventListener("click", () => decideProposal("reject"));
+
+document.querySelectorAll("[data-close-dialog]").forEach((button) => {
+  button.addEventListener("click", () => {
+    const dialog = document.querySelector(`#${button.dataset.closeDialog}`);
+    dialog?.close();
+  });
 });
 
 elements.settingsForm.addEventListener("submit", (event) => {

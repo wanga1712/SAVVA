@@ -32,6 +32,10 @@ def validate_parameters(value: Any, schema: dict[str, Any], path: str = "$") -> 
                 errors.append(f"{path}.{key}: additional property is not allowed")
 
     if expected_type == "array" and "items" in schema:
+        if "minItems" in schema and len(value) < schema["minItems"]:
+            errors.append(f"{path}: array has fewer than {schema['minItems']} items")
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            errors.append(f"{path}: array has more than {schema['maxItems']} items")
         for index, item in enumerate(value):
             errors.extend(validate_parameters(item, schema["items"], f"{path}[{index}]"))
 
@@ -40,6 +44,11 @@ def validate_parameters(value: Any, schema: dict[str, Any], path: str = "$") -> 
             errors.append(f"{path}: string is shorter than {schema['minLength']}")
         if "maxLength" in schema and len(value) > schema["maxLength"]:
             errors.append(f"{path}: string is longer than {schema['maxLength']}")
+        if "pattern" in schema and isinstance(schema["pattern"], str):
+            import re
+
+            if re.fullmatch(schema["pattern"], value) is None:
+                errors.append(f"{path}: string does not match the required pattern")
 
     if expected_type in {"integer", "number"}:
         if "minimum" in schema and value < schema["minimum"]:

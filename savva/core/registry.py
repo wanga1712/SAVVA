@@ -11,7 +11,8 @@ from typing import Any
 
 from .permissions import (
     IMPLEMENTED_PERMISSIONS,
-    READ_ONLY_RISK_LEVEL,
+    IMPLEMENTED_RISK_LEVELS,
+    WRITE_RISK_LEVEL,
     Permission,
     PermissionPolicy,
 )
@@ -152,8 +153,8 @@ class ToolRegistry:
             raise ToolRegistrationError("Handler must be callable.")
         if not contract.name or "." not in contract.name:
             raise ToolRegistrationError("Tool name must use a namespace such as system.summary.")
-        if contract.risk_level != READ_ONLY_RISK_LEVEL:
-            raise ToolRegistrationError("Only read_only tools may be registered in WIP-001.")
+        if contract.risk_level not in IMPLEMENTED_RISK_LEVELS:
+            raise ToolRegistrationError("Unsupported tool risk level.")
         if contract.timeout_seconds <= 0:
             raise ToolRegistrationError("Timeout must be positive.")
         try:
@@ -163,7 +164,11 @@ class ToolRegistry:
         if not permissions:
             raise ToolRegistrationError("Every tool must declare a permission.")
         if not permissions <= IMPLEMENTED_PERMISSIONS:
-            raise ToolRegistrationError("Only system.read may be executed in WIP-001.")
+            raise ToolRegistrationError("Contract requires an unimplemented permission.")
+        if Permission.FILES_WRITE in permissions and contract.risk_level != WRITE_RISK_LEVEL:
+            raise ToolRegistrationError("files.write tools must use the write risk level.")
+        if Permission.FILES_WRITE not in permissions and contract.risk_level == WRITE_RISK_LEVEL:
+            raise ToolRegistrationError("Write tools must declare files.write.")
         if not isinstance(contract.parameters, dict):
             raise ToolRegistrationError("Parameters must be a JSON Schema object.")
 

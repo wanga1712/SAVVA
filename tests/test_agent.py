@@ -20,7 +20,9 @@ from savva.agent.models import (
 )
 from savva.agent.network import TailscaleExitStatus, TailscaleInspector
 from savva.agent.orchestrator import AgentOrchestrator, _with_verified_summary
+from savva.agent.projects import ProjectService
 from savva.agent.sanitizer import constrain_read_only_answer, sanitize_for_model
+from savva.agent.tools import build_agent_registry
 from savva.agent.usage import UsageLogger
 from savva.agent.workspace import SafeWorkspace
 from savva.core.registry import ToolExecutionError, ToolRegistry
@@ -248,6 +250,52 @@ class SanitizerTests(unittest.TestCase):
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_project_create_is_executed_as_a_proposal_without_writes(self) -> None:
+        adapter = FakeAdapter(
+            [
+                response(
+                    calls=[
+                        ToolCall(
+                            "call-project",
+                            "savva_project_create",
+                            {
+                                "project_name": "demo-store",
+                                "title": "SAVVA Computers",
+                            },
+                            '{"project_name":"demo-store","title":"SAVVA Computers"}',
+                        )
+                    ]
+                ),
+                response(content="Proposal is ready for review."),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service = ProjectService(directory)
+            orchestrator = AgentOrchestrator(
+                adapter=adapter,
+                registry=build_agent_registry(directory, service),
+                workspace_root=directory,
+                max_tokens=512,
+                max_tool_steps=3,
+                max_requests_per_session=5,
+                max_request_cost_usd=0.1,
+                max_session_cost_usd=0.5,
+                max_duration_seconds=30,
+                usage_logger=UsageLogger(Path(directory) / "usage.jsonl"),
+                project_service=service,
+            )
+
+            result = orchestrator.run(
+                [], "Create the SAVVA store", session_id="project-session-agent"
+            )
+
+            proposal_events = [
+                event for event in result.events if event["type"] == "proposal_ready"
+            ]
+            self.assertEqual(len(proposal_events), 1)
+            self.assertEqual(proposal_events[0]["proposal"]["status"], "pending")
+            self.assertFalse((Path(directory) / "demo-store").exists())
+
     def test_multiple_tool_calls_are_executed_and_results_are_returned(self) -> None:
         registry = ToolRegistry()
         registry.register(

@@ -11,7 +11,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .agent.config import (
     AppSettings,
@@ -23,6 +23,7 @@ from .agent.config import (
 from .agent.models import ModelAdapterError, OllamaAdapter, OpenRouterAdapter
 from .agent.network import TailscaleExitStatus, TailscaleInspector
 from .agent.orchestrator import AgentOrchestrator, AgentRuntimeError
+from .agent.projects import ActionJournal, ProjectService
 from .agent.tools import build_agent_registry
 from .agent.usage import UsageLogger
 
@@ -72,6 +73,7 @@ class AppRuntime:
         project_root: Path | None = None,
         settings_path: Path | None = None,
         usage_path: Path | None = None,
+        action_log_path: Path | None = None,
         tailscale_inspector: TailscaleInspector | None = None,
     ):
         self.project_root = project_root or Path(__file__).resolve().parent.parent
@@ -85,8 +87,13 @@ class AppRuntime:
         self.settings_store = SettingsStore(settings, settings_path)
         self.settings_store.load()
         self.usage_logger = UsageLogger(usage_path or default_usage_log_path())
+        self.action_journal = ActionJournal(
+            action_log_path or default_usage_log_path().with_name("actions.jsonl")
+        )
         self.sessions = SessionStore()
         self.tailscale_inspector = tailscale_inspector or TailscaleInspector()
+        self._project_services: dict[str, ProjectService] = {}
+        self._project_services_lock = threading.Lock()
 
     def settings(self) -> AppSettings:
         return self.settings_store.get()
@@ -104,7 +111,17 @@ class AppRuntime:
         return result
 
     def tools(self) -> list[dict[str, Any]]:
-        return build_agent_registry(self.settings().workspace_root).list_tools()
+        root = self.settings().workspace_root
+        return build_agent_registry(root, self.project_service(root)).list_tools()
+
+    def project_service(self, workspace_root: str | None = None) -> ProjectService:
+        root = str(Path(workspace_root or self.settings().workspace_root).resolve())
+        with self._project_services_lock:
+            service = self._project_services.get(root)
+            if service is None:
+                service = ProjectService(root, self.action_journal)
+                self._project_services[root] = service
+            return service
 
     def tailscale_status(self) -> TailscaleExitStatus:
         return self.tailscale_inspector.inspect()
@@ -120,9 +137,10 @@ class AppRuntime:
                 "Set OPENROUTER_API_KEY in the backend environment before starting SAVVA.",
             )
         adapter = self._adapter(settings, key)
+        project_service = self.project_service(settings.workspace_root)
         orchestrator = AgentOrchestrator(
             adapter=adapter,
-            registry=build_agent_registry(settings.workspace_root),
+            registry=build_agent_registry(settings.workspace_root, project_service),
             workspace_root=settings.workspace_root,
             max_tokens=settings.max_tokens,
             max_tool_steps=settings.max_tool_steps,
@@ -131,6 +149,7 @@ class AppRuntime:
             max_session_cost_usd=settings.max_session_cost_usd,
             max_duration_seconds=settings.max_duration_seconds,
             usage_logger=self.usage_logger,
+            project_service=project_service,
         )
         previous = self.sessions.get(session_id)
         result = orchestrator.run(
@@ -242,6 +261,43 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if path == "/api/projects/tree":
+                query = parse_qs(urlparse(self.path).query)
+                requested = query.get("path", ["."])[0]
+                tree = self.server.runtime.project_service().inspect_tree(requested, 4)
+                self._json(HTTPStatus.OK, {"status": "success", **tree})
+                return
+            if path == "/api/files/content":
+                query = parse_qs(urlparse(self.path).query)
+                requested = query.get("path", [""])[0]
+                content = self.server.runtime.project_service().read_file(requested)
+                self._json(HTTPStatus.OK, {"status": "success", **content})
+                return
+            if path.startswith("/api/proposals/"):
+                proposal_id = path.removeprefix("/api/proposals/")
+                query = parse_qs(urlparse(self.path).query)
+                session_id = query.get("session_id", [""])[0]
+                if not 8 <= len(session_id) <= 100:
+                    self._error(
+                        HTTPStatus.BAD_REQUEST,
+                        "INVALID_SESSION",
+                        "A valid session_id is required.",
+                    )
+                    return
+                proposal = self.server.runtime.project_service().get_confirmation(
+                    proposal_id, session_id
+                )
+                self._json(HTTPStatus.OK, {"status": "success", "proposal": proposal})
+                return
+            if path == "/api/actions":
+                self._json(
+                    HTTPStatus.OK,
+                    {
+                        "status": "success",
+                        "actions": self.server.runtime.action_journal.recent(100),
+                    },
+                )
+                return
             if path in {"/", "/index.html"}:
                 self._static("index.html", "text/html; charset=utf-8")
                 return
@@ -303,10 +359,43 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"status": "success"})
                 return
             if path == "/api/confirm":
-                self._error(
-                    HTTPStatus.NOT_IMPLEMENTED,
-                    "CONFIRMATION_UNAVAILABLE",
-                    "No write-capable tools are registered in this WIP.",
+                proposal_id = body.get("proposal_id")
+                token = body.get("confirmation_token")
+                session_id = body.get("session_id")
+                decision = body.get("decision")
+                if not all(
+                    isinstance(value, str) and value
+                    for value in (proposal_id, token, session_id, decision)
+                ):
+                    self._error(
+                        HTTPStatus.BAD_REQUEST,
+                        "CONFIRMATION_INVALID",
+                        "proposal_id, confirmation_token, session_id, and decision are required.",
+                    )
+                    return
+                service = self.server.runtime.project_service()
+                if decision == "approve":
+                    proposal = service.apply(
+                        proposal_id=proposal_id,
+                        confirmation_token=token,
+                        session_id=session_id,
+                    )
+                elif decision == "reject":
+                    proposal = service.reject(
+                        proposal_id=proposal_id,
+                        confirmation_token=token,
+                        session_id=session_id,
+                    )
+                else:
+                    self._error(
+                        HTTPStatus.BAD_REQUEST,
+                        "DECISION_INVALID",
+                        "decision must be approve or reject.",
+                    )
+                    return
+                self._json(
+                    HTTPStatus.OK,
+                    {"status": "success", "proposal": proposal},
                 )
                 return
             self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Endpoint not found.")
@@ -318,6 +407,8 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
             )
         except SettingsError as exc:
             self._error(HTTPStatus.BAD_REQUEST, exc.code, exc.safe_message)
+        except PermissionError as exc:
+            self._error(HTTPStatus.FORBIDDEN, "ORIGIN_DENIED", str(exc))
         except (AgentRuntimeError, ModelAdapterError) as exc:
             self._error(HTTPStatus.BAD_GATEWAY, exc.code, exc.safe_message)
         except Exception:
@@ -337,10 +428,31 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
         content_type = self.headers.get("Content-Type", "")
         if "application/json" not in content_type.lower():
             raise ValueError("JSON content type required")
-        document = json.loads(self.rfile.read(length).decode("utf-8"))
+        raw_body = self.rfile.read(length)
+        self._require_same_origin()
+        document = json.loads(raw_body.decode("utf-8"))
         if not isinstance(document, dict):
             raise ValueError("JSON object required")
         return document
+
+    def _require_same_origin(self) -> None:
+        if self.headers.get("X-SAVVA-Request") != "1":
+            raise PermissionError("Missing same-origin request marker.")
+        host = self.headers.get("Host", "").strip()
+        allowed_hosts = (
+            host.startswith("127.0.0.1:")
+            or host == "127.0.0.1"
+            or host.startswith("localhost:")
+            or host == "localhost"
+            or host.startswith("[::1]:")
+        )
+        if not allowed_hosts:
+            raise PermissionError("Request host is not a local SAVVA origin.")
+        origin = self.headers.get("Origin")
+        if origin:
+            parsed = urlparse(origin)
+            if parsed.scheme != "http" or parsed.netloc != host:
+                raise PermissionError("Request origin does not match the local backend.")
 
     def _json(self, status: HTTPStatus, document: dict[str, Any]) -> None:
         payload = json.dumps(document, ensure_ascii=False, allow_nan=False).encode("utf-8")

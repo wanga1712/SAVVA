@@ -1,9 +1,10 @@
 # SAVVA Agent Runtime
 
-SAVVA is a Python 3.12, standard-library-first, read-only computer agent. It
-combines the WIP-001 tool registry with an OpenRouter model adapter, a guarded
-multi-step orchestrator, and a local web interface. Ollama is implemented as an
-OpenAI-compatible adapter but is never started by this WIP.
+SAVVA is a Python 3.12, standard-library-first computer and project agent. It
+combines a guarded OpenRouter model adapter, a multi-step orchestrator, a
+workspace-confined project builder, and a local web interface. Filesystem writes
+require a one-time approval of an exact verified proposal. Ollama is implemented
+as an OpenAI-compatible adapter but is never started.
 
 The graphical interface is a local, dependency-free HTML/CSS/JavaScript client
 served by the Python backend. It requires no React build or frontend package
@@ -122,8 +123,13 @@ availability and geographic restrictions remain controlled by OpenRouter.
 | `system.summary` | OS, CPU, RAM, GPU, and disk volumes | `system.read` |
 | `software.detect` | Detect one known tool, or all known tools with `name=all` / no name | `system.read` |
 | `development.inspect` | Core/web tooling, rule-based React + TypeScript readiness, safe-workspace dependency comparison | `system.read`, `workspace.read` |
-| `workspace.list` | Bounded listing inside the safe workspace | `workspace.read` |
-| `workspace.read` | Explicit UTF-8 project text reads, maximum 64 KiB | `workspace.read` |
+| `project.inspect` | Bounded workspace tree; symlinks and junctions are skipped | `workspace.read` |
+| `files.read` | Read an allowed UTF-8 file and return its current SHA-256 | `workspace.read` |
+| `project.create` | Prepare the built-in React/TypeScript/Vite project proposal | `workspace.read` |
+| `files.propose` | Prepare arbitrary allowed file changes without writing | `workspace.read` |
+| `files.diff` | Return a unified diff for a proposal | `workspace.read` |
+| `files.apply` | Request confirmation for an exact proposal; never auto-executes | `files.write` |
+| `project.validate` | Validate project files, package configuration, catalog, and page structure | `workspace.read` |
 
 Every result uses the same envelope:
 
@@ -147,10 +153,10 @@ Every result uses the same envelope:
 
 ## Safety model
 
-- Only `read_only` contracts with the implemented `system.read` or
-  `workspace.read` permissions can be registered.
-- `files.write`, `packages.install`, and `process.execute` are reserved
-  permission names but are not executable in this WIP.
+- Read tools require `system.read` or `workspace.read`. The sole write tool,
+  `files.apply`, requires `files.write` and is intercepted before execution.
+- `packages.install` and `process.execute` remain reserved and cannot be
+  registered.
 - Permission checks happen before parameter validation and handler execution.
 - Handlers run behind a timeout and exception boundary. Unknown, denied,
   malformed, timed-out, and failed calls return structured errors.
@@ -162,6 +168,18 @@ Every result uses the same envelope:
   1,000,000 bytes. Scripts are never executed.
 - Agent workspace reads reject absolute paths, parent traversal, symlinks,
   binary files, unapproved extensions, and files larger than 64 KiB.
+- Project writes reject `..`, absolute and drive paths, Windows reserved names,
+  trailing dots/spaces, reparse points, junctions, `.git`, `node_modules`,
+  `.env*`, binary content, credential-like material, and disallowed extensions.
+- Existing files require the SHA-256 returned by `files.read`. Every pending
+  proposal is re-hashed immediately before apply, so concurrent changes fail
+  with `STALE_PROPOSAL`.
+- Confirmation tokens are random, session-bound, one-time, and tied to a
+  fingerprint of exact paths and before/after hashes. Rejected, expired, used,
+  or mismatched proposals never write files.
+- Mutating HTTP endpoints require `X-SAVVA-Request: 1`, a loopback Host, and a
+  matching same-origin header when Origin is present. The backend sends no CORS
+  grants and does not log request bodies.
 - Outbound model messages redact API keys, bearer tokens, passwords, private
   keys, email addresses, user-profile path components, and environment-like
   secrets.
@@ -234,7 +252,7 @@ Observed result:
 ```text
 Model:       nvidia/nemotron-3.5-lightning:free
 Tool calls:  software.detect
-Node.js:     22.1
+Node.js:     24.22.1
 npm:         11.19.1
 Git:         2.54.0.windows.1
 Python/pip:  3.12.10 / 26.1
@@ -247,6 +265,57 @@ The answer reported the environment as ready, identified TypeScript and Vite
 as optional missing tools, and ended with the deterministic read-only next
 step. No package was installed and no project file was changed.
 
+Node.js `22.1` in older output was a parser defect: `node --version` returns
+`v24.22.1`, but the regex skipped the leading `v` and captured the suffix.
+WIP-003 fixes the parser and adds a regression test.
+
+## Controlled project builder
+
+The write flow is:
+
+1. The model calls `project.create` or `files.propose`.
+2. SAVVA validates paths, size, content, symlink/junction boundaries, and secret
+   patterns, then stores an in-memory pending proposal.
+3. The UI fetches the proposal through a session-bound endpoint and displays
+   every file plus a unified diff.
+4. The user chooses Approve or Reject. Approval carries a random one-time token.
+5. The backend re-hashes every existing target immediately before commit.
+6. Files are staged and committed with rollback on failure. A second approval
+   of the same proposal is rejected.
+
+Projects and file content live under `<repo>/workspace`, which is excluded from
+Git. The Projects tab provides a file tree, file viewer, proposal/diff dialog,
+Approve/Reject controls, and the agent action journal.
+
+The live acceptance created `workspace/savva-computers-store` only after model
+tool calls and explicit HTTP approval:
+
+```text
+Model calls:       project.create
+Files proposed:    19
+Before approval:   project directory absent
+Diff:              16,835 characters
+After approval:    project directory with 19 files
+project.validate:  valid
+Model requests:    2
+Cost:              $0.00
+```
+
+The generated page contains GAME, HOME, and AI cards, a responsive layout,
+React components, TypeScript/Vite configuration, and no invented confirmed
+prices or technical specifications. A second proposal was rejected and its
+directory remained absent.
+
+For an unattended browser acceptance run with Chrome remote debugging enabled:
+
+```powershell
+node scripts/ui_acceptance.mjs
+```
+
+The script drives the existing UI through the model request, diff review, and
+approval. It requires a running SAVVA server and an API key in the server
+process; neither is embedded in the script.
+
 ## Known limits
 
 - Version checks prove that the related client command ran, not that an
@@ -257,6 +326,11 @@ step. No package was installed and no project file was changed.
   for a future executor.
 - Project installation state is checked against the current Python environment
   and the selected project's `node_modules`.
-- The current WIP intentionally registers no write, package-install, or
-  process-execution tools. The UI includes a confirmation event surface for a
-  future permission-aware executor, but no such action can currently run.
+- Pending proposals are intentionally memory-only; restarting the server
+  invalidates unapproved proposals.
+- Writes are limited to UTF-8 text/config/source extensions and 1 MiB total.
+- File commit uses same-directory staging and rollback. Individual filesystem
+  writes cannot provide a distributed transaction across unrelated external
+  processes, but all proposal targets are re-hashed immediately before commit.
+- `packages.install`, `process.execute`, npm install, builds, and development
+  servers remain disabled. Execution belongs to the proposed SAVVA-004 WIP.

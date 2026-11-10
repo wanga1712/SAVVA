@@ -3,10 +3,13 @@ from __future__ import annotations
 import unittest
 from unittest.mock import Mock, patch
 
-from savva.tools.software import SoftwareDetector
+from savva.tools.software import SoftwareDetector, _extract_version
 
 
 class SoftwareDetectorTests(unittest.TestCase):
+    def test_v_prefixed_node_version_is_preserved(self) -> None:
+        self.assertEqual(_extract_version("v24.22.1"), "24.22.1")
+
     def test_detects_installed_program_and_version(self) -> None:
         detector = SoftwareDetector()
         with (

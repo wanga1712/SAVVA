@@ -4,4 +4,4 @@ from .core.registry import ToolRegistry
 from .tools import build_default_registry
 
 __all__ = ["ToolRegistry", "build_default_registry"]
-__version__ = "0.2.0"
+__version__ = "0.3.0"

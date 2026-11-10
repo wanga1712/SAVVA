@@ -189,5 +189,5 @@ def _extract_version(output: str) -> str:
     )
     if named:
         return named.group(1)[:100]
-    version = re.search(r"\b([0-9]+(?:\.[0-9A-Za-z+-]+)+)\b", first_line)
+    version = re.search(r"\bv?([0-9]+(?:\.[0-9A-Za-z+-]+)+)\b", first_line)
     return (version.group(1) if version else first_line)[:100]

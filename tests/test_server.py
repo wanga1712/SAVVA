@@ -53,6 +53,7 @@ class ServerTests(unittest.TestCase):
             project_root=root,
             settings_path=root / "settings.json",
             usage_path=root / "usage.jsonl",
+            action_log_path=root / "actions.jsonl",
             tailscale_inspector=self.tailscale,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -86,7 +87,10 @@ class ServerTests(unittest.TestCase):
             data=json.dumps(
                 {"message": "Check Node.js", "session_id": "session-test-1"}
             ).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "X-SAVVA-Request": "1",
+            },
             method="POST",
         )
         with self.assertRaises(urllib.error.HTTPError) as raised:
@@ -94,6 +98,109 @@ class ServerTests(unittest.TestCase):
         error = json.loads(raised.exception.read().decode("utf-8"))
 
         self.assertEqual(error["error"]["code"], "API_KEY_MISSING")
+
+    def test_post_without_same_origin_marker_is_rejected(self) -> None:
+        request = urllib.request.Request(
+            self.base_url + "/api/reset",
+            data=b'{"session_id":"session-test-2"}',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request, timeout=5)
+        error = json.loads(raised.exception.read().decode("utf-8"))
+
+        self.assertEqual(raised.exception.code, 403)
+        self.assertEqual(error["error"]["code"], "ORIGIN_DENIED")
+
+    def test_cross_origin_write_request_is_rejected(self) -> None:
+        request = urllib.request.Request(
+            self.base_url + "/api/reset",
+            data=b'{"session_id":"session-test-3"}',
+            headers={
+                "Content-Type": "application/json",
+                "X-SAVVA-Request": "1",
+                "Origin": "https://evil.example",
+            },
+            method="POST",
+        )
+
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request, timeout=5)
+
+        self.assertEqual(raised.exception.code, 403)
+
+    def test_proposal_confirmation_writes_exact_approved_files(self) -> None:
+        service = self.server.runtime.project_service()
+        session_id = "confirm-session-1"
+        proposal = service.create_template_proposal(
+            project_name="confirmed-store",
+            title="SAVVA Computers",
+            session_id=session_id,
+        )
+        confirmation = service.get_confirmation(proposal["proposal_id"], session_id)
+        body = json.dumps(
+            {
+                "proposal_id": proposal["proposal_id"],
+                "confirmation_token": confirmation["confirmation_token"],
+                "session_id": session_id,
+                "decision": "approve",
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            self.base_url + "/api/confirm",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-SAVVA-Request": "1",
+                "Origin": self.base_url,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual(result["proposal"]["status"], "applied")
+        self.assertTrue(
+            (Path(self.temporary.name) / "workspace" / "confirmed-store" / "package.json").is_file()
+        )
+
+    def test_proposal_rejection_over_http_does_not_write(self) -> None:
+        service = self.server.runtime.project_service()
+        session_id = "reject-session-1"
+        proposal = service.propose(
+            summary="Reject this file",
+            project_path="rejected-project",
+            changes=[{"path": "index.html", "content": "<h1>Rejected</h1>"}],
+            session_id=session_id,
+        )
+        confirmation = service.get_confirmation(proposal["proposal_id"], session_id)
+        body = json.dumps(
+            {
+                "proposal_id": proposal["proposal_id"],
+                "confirmation_token": confirmation["confirmation_token"],
+                "session_id": session_id,
+                "decision": "reject",
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            self.base_url + "/api/confirm",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-SAVVA-Request": "1",
+                "Origin": self.base_url,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual(result["proposal"]["status"], "rejected")
+        self.assertFalse(
+            (Path(self.temporary.name) / "workspace" / "rejected-project").exists()
+        )
 
     def test_expected_tailscale_exit_node_is_enforced(self) -> None:
         settings = self.server.runtime.settings()

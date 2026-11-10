@@ -2,6 +2,7 @@
 
 from .models import ModelAdapter, OllamaAdapter, OpenRouterAdapter
 from .orchestrator import AgentOrchestrator, AgentRunResult
+from .projects import ProjectService
 
 __all__ = [
     "AgentOrchestrator",
@@ -9,4 +10,5 @@ __all__ = [
     "ModelAdapter",
     "OllamaAdapter",
     "OpenRouterAdapter",
+    "ProjectService",
 ]

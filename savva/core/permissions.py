@@ -8,8 +8,8 @@ from enum import StrEnum
 class Permission(StrEnum):
     """Permissions understood by the registry.
 
-    Only ``SYSTEM_READ`` is executable in WIP-SAVVA-001. The remaining values
-    reserve stable names for a later permission-aware executor.
+    Read permissions and confirmation-gated ``files.write`` are implemented.
+    Package installation and process execution remain reserved.
     """
 
     SYSTEM_READ = "system.read"
@@ -19,24 +19,26 @@ class Permission(StrEnum):
     PROCESS_EXECUTE = "process.execute"
 
 
-IMPLEMENTED_PERMISSIONS = frozenset(
+READ_PERMISSIONS = frozenset(
     {Permission.SYSTEM_READ, Permission.WORKSPACE_READ}
 )
+IMPLEMENTED_PERMISSIONS = frozenset({*READ_PERMISSIONS, Permission.FILES_WRITE})
 FUTURE_PERMISSIONS = frozenset(
     {
-        Permission.FILES_WRITE,
         Permission.PACKAGES_INSTALL,
         Permission.PROCESS_EXECUTE,
     }
 )
 READ_ONLY_RISK_LEVEL = "read_only"
+WRITE_RISK_LEVEL = "write"
+IMPLEMENTED_RISK_LEVELS = frozenset({READ_ONLY_RISK_LEVEL, WRITE_RISK_LEVEL})
 
 
 class PermissionPolicy:
     """Explicit allow-list checked by the registry before execution."""
 
     def __init__(self, granted: set[Permission] | frozenset[Permission] | None = None):
-        self._granted = frozenset(granted) if granted is not None else IMPLEMENTED_PERMISSIONS
+        self._granted = frozenset(granted) if granted is not None else READ_PERMISSIONS
 
     @property
     def granted(self) -> frozenset[Permission]:

@@ -4,7 +4,7 @@ import json
 import time
 import unittest
 
-from savva.core.permissions import PermissionPolicy
+from savva.core.permissions import Permission, PermissionPolicy
 from savva.core.registry import (
     ToolRegistrationError,
     ToolRegistry,
@@ -99,7 +99,7 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertEqual(error_result.error["code"], "HANDLER_ERROR")
         self.assertNotIn("secret-detail", error_result.error["message"])
 
-    def test_only_read_only_system_read_tools_can_register(self) -> None:
+    def test_destructive_tools_cannot_register(self) -> None:
         registry = ToolRegistry()
         with self.assertRaises(ToolRegistrationError):
             registry.register(
@@ -110,6 +110,27 @@ class ToolRegistryTests(unittest.TestCase):
                 ),
                 lambda args: {},
             )
+
+    def test_write_tool_registers_but_default_policy_denies_execution(self) -> None:
+        registry = ToolRegistry()
+        registry.register(
+            contract(
+                name="files.apply",
+                risk_level="write",
+                permissions=("files.write",),
+            ),
+            lambda args: {"written": True},
+        )
+
+        denied = registry.invoke("files.apply", {"value": "x"})
+        allowed = registry.invoke(
+            "files.apply",
+            {"value": "x"},
+            policy=PermissionPolicy({Permission.FILES_WRITE}),
+        )
+
+        self.assertEqual(denied.error["code"], "PERMISSION_DENIED")
+        self.assertEqual(allowed.status, "success")
 
     def test_results_are_json_serializable(self) -> None:
         registry = ToolRegistry()
