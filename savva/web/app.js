@@ -10,6 +10,7 @@ const elements = {
   input: document.querySelector("#message-input"),
   send: document.querySelector("#send-button"),
   connection: document.querySelector("#connection-pill"),
+  network: document.querySelector("#network-pill"),
   toolList: document.querySelector("#tool-list"),
   toolCount: document.querySelector("#tool-count"),
   settingsDialog: document.querySelector("#settings-dialog"),
@@ -34,18 +35,31 @@ async function api(path, options = {}) {
 
 async function initialize() {
   try {
-    const [health, tools, settings] = await Promise.all([
+    const [health, tools, settings, network] = await Promise.all([
       api("/api/health"),
       api("/api/tools"),
       api("/api/settings"),
+      api("/api/network"),
     ]);
     renderHealth(health);
+    renderNetwork(network.tailscale);
     renderTools(tools.tools);
     applySettings(settings);
   } catch (error) {
     elements.connection.textContent = "Offline";
     elements.connection.className = "pill error";
   }
+}
+
+function renderNetwork(tailscale) {
+  if (!tailscale) return;
+  const ready = Boolean(tailscale.ready);
+  const hostname = tailscale.exit_node_hostname || "exit node unavailable";
+  elements.network.textContent = `Tailscale: ${hostname}`;
+  elements.network.className = `pill ${ready ? "ready" : "error"}`;
+  elements.network.title = ready
+    ? `Exit node: ${tailscale.exit_node_dns_name || hostname}`
+    : tailscale.error || "Tailscale exit node is unavailable.";
 }
 
 function renderHealth(health) {
@@ -106,6 +120,7 @@ function addAgentShell() {
 }
 
 function renderAgentResult(shell, result) {
+  if (result.egress) renderNetwork(result.egress);
   shell.thinking.remove();
   const timeline = document.createElement("div");
   timeline.className = "tool-timeline";
@@ -350,7 +365,12 @@ function applySettings(settings) {
   state.settings = settings;
   const form = elements.settingsForm.elements;
   for (const [name, value] of Object.entries(settings)) {
-    if (form[name]) form[name].value = value ?? "";
+    if (!form[name]) continue;
+    if (form[name].type === "checkbox") {
+      form[name].checked = Boolean(value);
+    } else {
+      form[name].value = value ?? "";
+    }
   }
   elements.keyStatus.textContent =
     settings.provider === "openrouter"
@@ -372,6 +392,9 @@ async function saveSettings() {
     max_session_cost_usd: Number(form.get("max_session_cost_usd")),
     max_duration_seconds: Number(form.get("max_duration_seconds")),
     workspace_root: form.get("workspace_root"),
+    require_tailscale_exit_node:
+      form.get("require_tailscale_exit_node") === "on",
+    expected_exit_node: form.get("expected_exit_node"),
   };
   try {
     const result = await api("/api/settings", {

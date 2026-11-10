@@ -18,6 +18,7 @@ from savva.agent.models import (
     OpenRouterAdapter,
     ToolCall,
 )
+from savva.agent.network import TailscaleExitStatus, TailscaleInspector
 from savva.agent.orchestrator import AgentOrchestrator, _with_verified_summary
 from savva.agent.sanitizer import constrain_read_only_answer, sanitize_for_model
 from savva.agent.usage import UsageLogger
@@ -221,6 +222,29 @@ class SanitizerTests(unittest.TestCase):
 
         self.assertIn("- node: 22.1", answer)
         self.assertIn("Model answer", answer)
+
+    def test_tailscale_status_parser_selects_current_exit_node(self) -> None:
+        status = TailscaleInspector.parse_status(
+            {
+                "BackendState": "Running",
+                "ExitNodeStatus": {"ID": "node-1", "Online": True},
+                "Peer": {
+                    "internal-key-that-does-not-match-id": {
+                        "ID": "node-1",
+                        "HostName": "squealing-orange",
+                        "DNSName": "squealing-orange.example.ts.net.",
+                        "TailscaleIPs": ["100.87.196.23"],
+                        "Online": True,
+                    }
+                },
+            }
+        )
+
+        self.assertTrue(status.ready)
+        self.assertEqual(status.exit_node_hostname, "squealing-orange")
+        self.assertEqual(
+            status.exit_node_dns_name, "squealing-orange.example.ts.net"
+        )
 
 
 class OrchestratorTests(unittest.TestCase):

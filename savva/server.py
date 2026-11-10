@@ -21,6 +21,7 @@ from .agent.config import (
     settings_from_environment,
 )
 from .agent.models import ModelAdapterError, OllamaAdapter, OpenRouterAdapter
+from .agent.network import TailscaleExitStatus, TailscaleInspector
 from .agent.orchestrator import AgentOrchestrator, AgentRuntimeError
 from .agent.tools import build_agent_registry
 from .agent.usage import UsageLogger
@@ -71,6 +72,7 @@ class AppRuntime:
         project_root: Path | None = None,
         settings_path: Path | None = None,
         usage_path: Path | None = None,
+        tailscale_inspector: TailscaleInspector | None = None,
     ):
         self.project_root = project_root or Path(__file__).resolve().parent.parent
         try:
@@ -84,6 +86,7 @@ class AppRuntime:
         self.settings_store.load()
         self.usage_logger = UsageLogger(usage_path or default_usage_log_path())
         self.sessions = SessionStore()
+        self.tailscale_inspector = tailscale_inspector or TailscaleInspector()
 
     def settings(self) -> AppSettings:
         return self.settings_store.get()
@@ -103,8 +106,13 @@ class AppRuntime:
     def tools(self) -> list[dict[str, Any]]:
         return build_agent_registry(self.settings().workspace_root).list_tools()
 
+    def tailscale_status(self) -> TailscaleExitStatus:
+        return self.tailscale_inspector.inspect()
+
     def chat(self, message: str, session_id: str) -> dict[str, Any]:
         settings = self.settings()
+        egress = self.tailscale_status()
+        self._validate_egress(settings, egress)
         key = self.api_key()
         if settings.provider == "openrouter" and key is None:
             raise AgentRuntimeError(
@@ -148,7 +156,31 @@ class AppRuntime:
             "usage": result.usage,
             "provider": settings.provider,
             "model": settings.model,
+            "egress": egress.to_dict(),
         }
+
+    @staticmethod
+    def _validate_egress(
+        settings: AppSettings, egress: TailscaleExitStatus
+    ) -> None:
+        if not settings.require_tailscale_exit_node:
+            return
+        if not egress.ready:
+            raise AgentRuntimeError(
+                "TAILSCALE_EXIT_NODE_UNAVAILABLE",
+                "SAVVA requires an online Tailscale exit node, but none is selected.",
+            )
+        expected = settings.expected_exit_node.strip().lower().rstrip(".")
+        if expected:
+            candidates = {
+                (egress.exit_node_hostname or "").lower(),
+                (egress.exit_node_dns_name or "").lower().rstrip("."),
+            }
+            if expected not in candidates:
+                raise AgentRuntimeError(
+                    "TAILSCALE_EXIT_NODE_MISMATCH",
+                    f"Expected Tailscale exit node '{expected}', but another node is selected.",
+                )
 
     @staticmethod
     def _adapter(settings: AppSettings, key: str | None):
@@ -175,6 +207,7 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
         try:
             if path == "/api/health":
                 settings = self.server.runtime.public_settings()
+                egress = self.server.runtime.tailscale_status()
                 self._json(
                     HTTPStatus.OK,
                     {
@@ -183,6 +216,11 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
                         "model": settings["model"],
                         "api_key_configured": settings["api_key_configured"],
                         "workspace_root": settings["workspace_root"],
+                        "require_tailscale_exit_node": settings[
+                            "require_tailscale_exit_node"
+                        ],
+                        "expected_exit_node": settings["expected_exit_node"],
+                        "tailscale": egress.to_dict(),
                     },
                 )
                 return
@@ -193,6 +231,15 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
                 self._json(
                     HTTPStatus.OK,
                     {"status": "success", "tools": self.server.runtime.tools()},
+                )
+                return
+            if path == "/api/network":
+                self._json(
+                    HTTPStatus.OK,
+                    {
+                        "status": "success",
+                        "tailscale": self.server.runtime.tailscale_status().to_dict(),
+                    },
                 )
                 return
             if path in {"/", "/index.html"}:

@@ -18,6 +18,7 @@
         </div>
       </div>
       <div class="topbar-actions">
+        <span id="network-pill" class="pill status-loading">Tailscale</span>
         <span id="connection-pill" class="pill status-loading">Connecting</span>
         <button id="new-chat" class="button ghost" type="button">New chat</button>
         <button id="open-settings" class="button ghost" type="button">Settings</button>
@@ -124,6 +125,14 @@
         </label>
         <label class="span-2">Safe workspace
           <input name="workspace_root" id="workspace_root" maxlength="1000" required>
+        </label>
+        <label class="checkbox-label">
+          <input name="require_tailscale_exit_node" id="require_tailscale" type="checkbox">
+          Require Tailscale exit node
+        </label>
+        <label>Expected exit node
+          <input name="expected_exit_node" id="expected_exit_node"
+            maxlength="253" placeholder="squealing-orange">
         </label>
       </div>
       <p id="settings-error" class="form-error" role="alert"></p>

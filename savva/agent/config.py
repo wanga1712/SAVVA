@@ -36,6 +36,8 @@ class AppSettings:
     max_duration_seconds: float = 120.0
     workspace_root: str = ""
     reasoning_effort: str = "low"
+    require_tailscale_exit_node: bool = False
+    expected_exit_node: str = ""
 
     def validate(self) -> None:
         if self.provider not in {"openrouter", "ollama"}:
@@ -62,6 +64,8 @@ class AppSettings:
             )
         if self.reasoning_effort not in {"minimal", "low", "medium", "high", "max"}:
             raise SettingsError("INVALID_SETTINGS", "Reasoning effort is invalid.")
+        if len(self.expected_exit_node) > 253:
+            raise SettingsError("INVALID_SETTINGS", "Expected exit node is too long.")
         parsed = urlparse(self.base_url)
         if self.provider == "openrouter":
             if parsed.scheme != "https" or parsed.hostname != "openrouter.ai":
@@ -125,6 +129,10 @@ def settings_from_environment(project_root: Path | None = None) -> AppSettings:
         max_duration_seconds=_env_float("SAVVA_MAX_DURATION_SECONDS", 120.0),
         workspace_root=str(Path(workspace).expanduser().resolve()),
         reasoning_effort=os.environ.get("SAVVA_REASONING_EFFORT", "low").strip().lower(),
+        require_tailscale_exit_node=_env_bool(
+            "SAVVA_REQUIRE_TAILSCALE_EXIT_NODE", False
+        ),
+        expected_exit_node=os.environ.get("SAVVA_EXPECTED_EXIT_NODE", "").strip(),
     )
     settings.validate()
     return settings
@@ -226,6 +234,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _coerce_setting(key: str, value: Any) -> Any:
     if key in {
         "max_tokens",
@@ -239,4 +254,8 @@ def _coerce_setting(key: str, value: Any) -> Any:
         "max_duration_seconds",
     }:
         return float(value)
+    if key == "require_tailscale_exit_node":
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
     return str(value).strip() if value is not None else ""

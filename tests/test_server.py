@@ -10,7 +10,17 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
+from savva.agent.network import TailscaleExitStatus
+from savva.agent.orchestrator import AgentRuntimeError
 from savva.server import AppRuntime, SavvaHTTPServer, SavvaRequestHandler
+
+
+class FakeTailscaleInspector:
+    def __init__(self, status: TailscaleExitStatus):
+        self.status = status
+
+    def inspect(self) -> TailscaleExitStatus:
+        return self.status
 
 
 class ServerTests(unittest.TestCase):
@@ -27,10 +37,23 @@ class ServerTests(unittest.TestCase):
         self.environment_patch.start()
         os.environ.pop("OPENROUTER_API_KEY", None)
         self.server = SavvaHTTPServer(("127.0.0.1", 0), SavvaRequestHandler)
+        self.tailscale = FakeTailscaleInspector(
+            TailscaleExitStatus(
+                installed=True,
+                backend_state="Running",
+                exit_node_id="node-1",
+                exit_node_hostname="squealing-orange",
+                exit_node_dns_name="squealing-orange.example.ts.net",
+                exit_node_online=True,
+                exit_node_addresses=("100.87.196.23",),
+                ready=True,
+            )
+        )
         self.server.runtime = AppRuntime(
             project_root=root,
             settings_path=root / "settings.json",
             usage_path=root / "usage.jsonl",
+            tailscale_inspector=self.tailscale,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -51,6 +74,8 @@ class ServerTests(unittest.TestCase):
             html = response.read().decode("utf-8")
 
         self.assertFalse(health["api_key_configured"])
+        self.assertEqual(health["tailscale"]["exit_node_hostname"], "squealing-orange")
+        self.assertTrue(health["tailscale"]["ready"])
         self.assertNotIn("OPENROUTER_API_KEY=", json.dumps(health))
         self.assertIn("default-src 'self'", csp)
         self.assertIn("SAVVA Agent", html)
@@ -69,6 +94,21 @@ class ServerTests(unittest.TestCase):
         error = json.loads(raised.exception.read().decode("utf-8"))
 
         self.assertEqual(error["error"]["code"], "API_KEY_MISSING")
+
+    def test_expected_tailscale_exit_node_is_enforced(self) -> None:
+        settings = self.server.runtime.settings()
+        settings = type(settings)(
+            **{
+                **settings.to_public_dict(),
+                "require_tailscale_exit_node": True,
+                "expected_exit_node": "another-node",
+            }
+        )
+
+        with self.assertRaises(AgentRuntimeError) as raised:
+            AppRuntime._validate_egress(settings, self.tailscale.status)
+
+        self.assertEqual(raised.exception.code, "TAILSCALE_EXIT_NODE_MISMATCH")
 
 
 if __name__ == "__main__":

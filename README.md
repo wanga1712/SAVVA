@@ -12,7 +12,8 @@ installation.
 The default cloud model is the free
 `nvidia/nemotron-3.5-lightning:free`, verified to execute registered tool calls.
 `thinkingmachines/inkling-2-small:free` and `qwen/qwen3.5-9b` remain
-configurable. Inkling is currently region-restricted in the development region.
+configurable. Inkling still returns a regional `403` through the current
+Netherlands exit node.
 
 ## Commands
 
@@ -75,9 +76,44 @@ set with environment variables:
 | `SAVVA_MAX_SESSION_COST` | `0.25` USD |
 | `SAVVA_MAX_DURATION_SECONDS` | `120` |
 | `SAVVA_WORKSPACE_ROOT` | `<repo>\workspace` |
+| `SAVVA_REQUIRE_TAILSCALE_EXIT_NODE` | `false` |
+| `SAVVA_EXPECTED_EXIT_NODE` | empty |
 
 For a future Ollama run, select `ollama` and use a loopback OpenAI-compatible
 endpoint such as `http://127.0.0.1:11434/v1`. SAVVA does not install or start it.
+
+## Tailscale model egress
+
+Model requests inherit the Windows route of the Python backend. When Tailscale
+is using an exit node, OpenRouter traffic therefore leaves through that exit
+node without a system-wide configuration change made by SAVVA.
+
+The local SAVVA settings on this machine require the online exit node
+`squealing-orange`. Before every model run, the backend reads
+`tailscale status --json` with fixed arguments and checks:
+
+- Tailscale backend is `Running`;
+- an exit node is selected and online;
+- the selected node matches `expected_exit_node`, when configured.
+
+If these checks fail, the request stops with
+`TAILSCALE_EXIT_NODE_UNAVAILABLE` or `TAILSCALE_EXIT_NODE_MISMATCH` before any
+OpenRouter call. `GET /api/network` exposes the current non-secret Tailscale
+status to the UI. SAVVA never changes Tailscale, Windows routes, DNS, or system
+proxy settings.
+
+The verified current route is:
+
+```text
+Tailscale:   Running
+Exit node:   squealing-orange
+Node IP:     100.87.196.23
+External IP: NL
+OpenRouter:  HTTP 200
+```
+
+The OpenRouter free NVIDIA model works through this route. Free-model
+availability and geographic restrictions remain controlled by OpenRouter.
 
 ## Registered tools
 
@@ -131,6 +167,8 @@ Every result uses the same envelope:
   secrets.
 - Usage logs contain metadata and cost only, not prompts, responses, tool
   content, or credentials.
+- Model requests can be gated on a selected online Tailscale exit node. The
+  gate is read-only and does not alter routing.
 - Final read-only answers are filtered to remove command, terminal, install,
   project-creation, and development-server instructions. The deterministic
   safe next step is to agree on a project name and template before any future
