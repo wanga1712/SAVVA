@@ -95,7 +95,8 @@ class SafeWorkspace:
         }
 
     def _resolve(self, relative_path: str) -> Path:
-        raw = Path(relative_path or ".")
+        normalized = (relative_path or ".").replace("\\", "/")
+        raw = Path(normalized)
         if raw.is_absolute() or raw.drive:
             raise ToolExecutionError("WORKSPACE_PATH_DENIED", "Absolute paths are not allowed.")
         if ".." in raw.parts:

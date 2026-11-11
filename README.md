@@ -316,6 +316,32 @@ The script drives the existing UI through the model request, diff review, and
 approval. It requires a running SAVVA server and an API key in the server
 process; neither is embedded in the script.
 
+## Deployment on s13
+
+SAVVA is deployed to the Tailscale Linux host `s13` under
+`/home/sergey/savva-app` and runs as the lingering systemd user service
+`savva.service`. The backend listens only on remote loopback
+`127.0.0.1:8765`; it is not exposed directly to the Tailscale network.
+
+The Windows launcher:
+
+1. starts the remote user service over Tailscale SSH;
+2. opens a private SSH tunnel from local `127.0.0.1:8765` to `s13`;
+3. waits for the SAVVA health endpoint;
+4. opens the UI in a Google Chrome app window.
+
+```powershell
+powershell.exe -NoProfile -WindowStyle Hidden `
+  -ExecutionPolicy Bypass `
+  -File C:\Users\Lenovo\Projects\savva\scripts\Start-SAVVA.ps1
+```
+
+The desktop shortcut `SAVVA` invokes this launcher. The remote key is stored in
+`~/.config/savva/openrouter.env` with mode `0600` and is referenced by the
+systemd service through `EnvironmentFile`; it is not present in the repository,
+desktop shortcut, launcher, browser, or logs. `s13` uses the
+`squealing-orange` Tailscale exit node for model egress.
+
 ## Known limits
 
 - Version checks prove that the related client command ran, not that an
