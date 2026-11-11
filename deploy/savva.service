@@ -1,0 +1,22 @@
+[Unit]
+Description=SAVVA OpenRouter agent
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/sergey/savva-app
+EnvironmentFile=/home/sergey/.config/savva/openrouter.env
+Environment=PYTHONUNBUFFERED=1
+Environment=SAVVA_REQUIRE_TAILSCALE_EXIT_NODE=true
+Environment=SAVVA_EXPECTED_EXIT_NODE=squealing-orange
+Environment=SAVVA_WORKSPACE_ROOT=/home/sergey/savva-app/workspace
+ExecStart=/usr/bin/python3 -m savva.cli serve --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
