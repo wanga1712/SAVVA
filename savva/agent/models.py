@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -10,15 +11,21 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Protocol
+from urllib.parse import quote
 
 from .sanitizer import redact_text
 
 
 class ModelAdapterError(RuntimeError):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, *, failure_kind: str = "unknown",
+                 quota_snapshot: dict[str, Any] | None = None,
+                 status_code: int | None = None):
         super().__init__(message)
         self.code = code
         self.safe_message = message
+        self.failure_kind = failure_kind
+        self.quota_snapshot = quota_snapshot
+        self.status_code = status_code
 
 
 @dataclass(slots=True)
@@ -111,15 +118,35 @@ class UrllibJsonTransport:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
             detail = ""
+            document: dict[str, Any] = {}
             try:
                 detail = exc.read(1000).decode("utf-8", errors="replace")
+                parsed = json.loads(detail)
+                if isinstance(parsed, dict):
+                    document = parsed
             except OSError:
+                pass
+            except (UnicodeError, json.JSONDecodeError):
                 pass
             safe_detail = redact_text(detail)[:500]
             message = f"Provider returned HTTP {exc.code}."
             if safe_detail:
                 message += f" {safe_detail}"
-            raise ModelAdapterError("MODEL_HTTP_ERROR", message) from None
+            error_document = document.get("error", {})
+            error_code = str(error_document.get("code", "")).lower() if isinstance(error_document, dict) else ""
+            error_kind = str(error_document.get("type", "")).lower() if isinstance(error_document, dict) else ""
+            if exc.code in {401, 403}:
+                failure_kind = "auth"
+            elif "quota" in error_code or "usage_limit" in error_code or "insufficient_quota" in error_code:
+                failure_kind = "quota"
+            elif exc.code == 503:
+                failure_kind = "overload"
+            elif exc.code == 429 or "rate_limit" in error_kind:
+                failure_kind = "rate_limit"
+            else:
+                failure_kind = "unknown"
+            raise ModelAdapterError("MODEL_HTTP_ERROR", message, failure_kind=failure_kind,
+                                    status_code=exc.code) from None
         except (urllib.error.URLError, TimeoutError, OSError):
             raise ModelAdapterError(
                 "MODEL_CONNECTION_ERROR", "The model provider could not be reached."
@@ -154,6 +181,16 @@ class OpenAICompatibleAdapter(ModelAdapter):
         self._api_key = api_key
         self.reasoning_effort = reasoning_effort
         self._transport = transport or UrllibJsonTransport()
+        self._last_price: tuple[float, float] | None = None
+
+    def max_cost_estimate(self, messages: list[dict[str, Any]], max_tokens: int) -> float:
+        if self.provider != "openrouter":
+            return 0.0
+        prompt_price, completion_price = _openrouter_model_price(self.base_url, self.model)
+        self._last_price = (prompt_price, completion_price)
+        prompt_bytes = len(json.dumps(messages, ensure_ascii=False).encode("utf-8")) + 4096
+        upper_bound = prompt_bytes * prompt_price + max_tokens * completion_price
+        return upper_bound * 1.25
 
     def complete(
         self,
@@ -194,7 +231,14 @@ class OpenAICompatibleAdapter(ModelAdapter):
             headers,
             timeout_seconds,
         )
-        return self._parse_response(document)
+        result = self._parse_response(document)
+        if self.provider == "openrouter" and result.usage.cost_usd == 0 and self._last_price:
+            prompt_price, completion_price = self._last_price
+            result.usage.cost_usd = (
+                result.usage.prompt_tokens * prompt_price
+                + result.usage.completion_tokens * completion_price
+            )
+        return result
 
     def _completion_url(self) -> str:
         if self.base_url.endswith("/chat/completions"):
@@ -310,3 +354,40 @@ class OllamaAdapter(OpenAICompatibleAdapter):
             api_key=None,
             transport=transport,
         )
+
+
+_MODEL_PRICE_CACHE: dict[tuple[str, str], tuple[float, float, float]] = {}
+_MODEL_PRICE_LOCK = threading.Lock()
+
+
+def _openrouter_model_price(base_url: str, model: str) -> tuple[float, float]:
+    key = (base_url.rstrip("/"), model)
+    with _MODEL_PRICE_LOCK:
+        cached = _MODEL_PRICE_CACHE.get(key)
+        if cached and cached[2] > time.time():
+            return cached[0], cached[1]
+    request = urllib.request.Request(
+        f"{key[0]}/models?q={quote(model)}",
+        headers={"Accept": "application/json", "User-Agent": "SAVVA/0.4"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            raw = response.read(20_000_001)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise ModelAdapterError("MODEL_PRICE_UNAVAILABLE", "Fallback pricing could not be verified.", failure_kind="transient") from None
+    if len(raw) > 20_000_000:
+        raise ModelAdapterError("MODEL_PRICE_TOO_LARGE", "Fallback pricing response exceeded its size limit.", failure_kind="protocol")
+    try:
+        document = json.loads(raw.decode("utf-8"))
+        entries = document.get("data", [])
+        item = next(value for value in entries if value.get("id") == model)
+        pricing = item["pricing"]
+        prompt, completion = float(pricing["prompt"]), float(pricing["completion"])
+        if prompt < 0 or completion < 0:
+            raise ValueError("negative model price")
+    except (UnicodeError, ValueError, KeyError, TypeError, StopIteration):
+        raise ModelAdapterError("MODEL_PRICE_INVALID", "Fallback model pricing is unavailable or invalid.", failure_kind="protocol") from None
+    with _MODEL_PRICE_LOCK:
+        _MODEL_PRICE_CACHE[key] = (prompt, completion, time.time() + 600)
+    return prompt, completion

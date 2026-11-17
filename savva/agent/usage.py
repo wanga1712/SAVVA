@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +70,30 @@ class UsageLogger:
         except OSError:
             pass
         return usage
+
+    def daily_cost(self, timestamp: float | None = None) -> float:
+        """Sum recorded provider charges since the current UTC midnight."""
+        now = timestamp if timestamp is not None else time.time()
+        day_start = datetime.fromtimestamp(now, timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).timestamp()
+        total = 0.0
+        try:
+            if self.path.stat().st_size > 20_000_000:
+                return float("inf")
+            with self.path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        return float("inf")
+                    if float(item.get("timestamp_unix", 0)) >= day_start:
+                        total += max(0.0, float(item.get("cost_usd", 0)))
+        except FileNotFoundError:
+            return 0.0
+        except OSError:
+            return float("inf")
+        return round(total, 8)
 
 
 class BudgetExceeded(RuntimeError):

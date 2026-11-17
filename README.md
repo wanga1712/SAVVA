@@ -74,10 +74,21 @@ set with environment variables:
 | `SAVVA_MAX_TOOL_STEPS` | `6` |
 | `SAVVA_MAX_REQUESTS` | `12` |
 | `SAVVA_MAX_REQUEST_COST` | `0.05` USD |
-| `SAVVA_MAX_SESSION_COST` | `0.25` USD |
+| `SAVVA_MAX_SESSION_COST` | `1.0` USD |
 | `SAVVA_MAX_DURATION_SECONDS` | `120` |
 | `SAVVA_WORKSPACE_ROOT` | `<repo>\workspace` |
 | `SAVVA_REQUIRE_TAILSCALE_EXIT_NODE` | `false` |
+| `SAVVA_CODEX_MODEL` | Codex CLI default |
+| `SAVVA_FAILOVER_DAILY_BUDGET_USD` | `3.0` USD |
+| `SAVVA_FAILOVER_ENABLED` | `true` |
+
+When Codex CLI is authenticated with ChatGPT, SAVVA uses Codex App Server as
+the primary chat provider and the configured OpenRouter/Ollama adapter as its
+fallback. Failover requires a confirmed Codex quota limit; authentication,
+configuration, timeout, and transient errors do not trigger paid fallback.
+Fallback requests require public model pricing and stay within the per-request,
+per-session, and daily budget guards. Chat sessions and unfinished operation IDs
+are saved locally in `%LOCALAPPDATA%\SAVVA\sessions.json`.
 | `SAVVA_EXPECTED_EXIT_NODE` | empty |
 
 For a future Ollama run, select `ollama` and use a loopback OpenAI-compatible

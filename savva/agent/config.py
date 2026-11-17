@@ -32,9 +32,12 @@ class AppSettings:
     max_tool_steps: int = 6
     max_requests_per_session: int = 12
     max_request_cost_usd: float = 0.05
-    max_session_cost_usd: float = 0.25
+    max_session_cost_usd: float = 1.0
     max_duration_seconds: float = 120.0
     workspace_root: str = ""
+    codex_model: str = ""
+    failover_daily_budget_usd: float = 3.0
+    failover_enabled: bool = True
     reasoning_effort: str = "low"
     require_tailscale_exit_node: bool = False
     expected_exit_node: str = ""
@@ -57,6 +60,10 @@ class AppSettings:
             raise SettingsError("INVALID_SETTINGS", "Request cost limit is invalid.")
         if not 0 <= self.max_session_cost_usd <= 10000:
             raise SettingsError("INVALID_SETTINGS", "Session cost limit is invalid.")
+        if not 0 <= self.failover_daily_budget_usd <= 10000:
+            raise SettingsError("INVALID_SETTINGS", "Failover daily cost limit is invalid.")
+        if len(self.codex_model) > 200:
+            raise SettingsError("INVALID_SETTINGS", "Codex model identifier is invalid.")
         if not 5 <= self.max_duration_seconds <= 600:
             raise SettingsError(
                 "INVALID_SETTINGS",
@@ -125,8 +132,11 @@ def settings_from_environment(project_root: Path | None = None) -> AppSettings:
         max_tool_steps=_env_int("SAVVA_MAX_TOOL_STEPS", 6),
         max_requests_per_session=_env_int("SAVVA_MAX_REQUESTS", 12),
         max_request_cost_usd=_env_float("SAVVA_MAX_REQUEST_COST", 0.05),
-        max_session_cost_usd=_env_float("SAVVA_MAX_SESSION_COST", 0.25),
+        max_session_cost_usd=_env_float("SAVVA_MAX_SESSION_COST", 1.0),
         max_duration_seconds=_env_float("SAVVA_MAX_DURATION_SECONDS", 120.0),
+        codex_model=os.environ.get("SAVVA_CODEX_MODEL", "").strip(),
+        failover_daily_budget_usd=_env_float("SAVVA_FAILOVER_DAILY_BUDGET_USD", 3.0),
+        failover_enabled=_env_bool("SAVVA_FAILOVER_ENABLED", True),
         workspace_root=str(Path(workspace).expanduser().resolve()),
         reasoning_effort=os.environ.get("SAVVA_REASONING_EFFORT", "low").strip().lower(),
         require_tailscale_exit_node=_env_bool(

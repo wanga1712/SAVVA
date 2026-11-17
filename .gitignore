@@ -7,3 +7,13 @@ dist/
 *.egg-info/
 workspace/
 .savva/
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+secrets.*
+sessions.json
+usage.jsonl
+actions.jsonl

@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from savva.agent.network import TailscaleExitStatus
 from savva.agent.orchestrator import AgentRuntimeError
-from savva.server import AppRuntime, SavvaHTTPServer, SavvaRequestHandler
+from savva.server import AppRuntime, SavvaHTTPServer, SavvaRequestHandler, SessionState
 
 
 class FakeTailscaleInspector:
@@ -32,6 +32,7 @@ class ServerTests(unittest.TestCase):
             "SAVVA_PROVIDER": "openrouter",
             "SAVVA_MODEL": "nvidia/nemotron-3.5-lightning:free",
             "SAVVA_BASE_URL": "https://openrouter.ai/api/v1",
+            "SAVVA_FAILOVER_ENABLED": "false",
         }
         self.environment_patch = patch.dict(os.environ, environment, clear=False)
         self.environment_patch.start()
@@ -98,6 +99,28 @@ class ServerTests(unittest.TestCase):
         error = json.loads(raised.exception.read().decode("utf-8"))
 
         self.assertEqual(error["error"]["code"], "API_KEY_MISSING")
+
+    def test_session_context_and_idempotency_survive_runtime_restart(self) -> None:
+        session_id, operation_id = "session-persist-1", "operation-persist-1"
+        cached = {"status": "success", "session_id": session_id, "answer": "cached result",
+                  "active_provider": "openrouter", "active_model": "backup-model"}
+        self.server.runtime.sessions.set(session_id, SessionState(
+            messages=[{"role": "user", "content": "continue WIP"},
+                      {"role": "assistant", "content": "cached result"}],
+            requests=2, cost_usd=0.12, failover_state="FALLBACK_ACTIVE",
+            fallback_reason="confirmed_quota_exhaustion", next_quota_check=2_000_000_000,
+            last_operation_id=operation_id, last_result=cached,
+        ))
+        root = Path(self.temporary.name)
+        restarted = AppRuntime(
+            project_root=root, settings_path=root / "settings.json",
+            usage_path=root / "usage.jsonl", action_log_path=root / "actions.jsonl",
+            tailscale_inspector=self.tailscale,
+        )
+        restored = restarted.sessions.get(session_id)
+        self.assertEqual(restored.failover_state, "FALLBACK_ACTIVE")
+        self.assertEqual(restored.messages[-1]["content"], "cached result")
+        self.assertEqual(restarted.chat("retry", session_id, operation_id), cached)
 
     def test_post_without_same_origin_marker_is_rejected(self) -> None:
         request = urllib.request.Request(

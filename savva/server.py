@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import threading
+import uuid
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,11 +24,14 @@ from .agent.config import (
     settings_from_environment,
 )
 from .agent.models import ModelAdapterError, OllamaAdapter, OpenRouterAdapter
+from .agent.codex_app_server import CodexAppServerAdapter
+from .agent.failover import FailoverEngine, FailoverState
 from .agent.network import TailscaleExitStatus, TailscaleInspector
 from .agent.orchestrator import AgentOrchestrator, AgentRuntimeError
 from .agent.projects import ActionJournal, ProjectService
 from .agent.tools import build_agent_registry
 from .agent.usage import UsageLogger
+from .agent.usage import BudgetExceeded
 
 MAX_REQUEST_BODY = 65_536
 MAX_MESSAGE_LENGTH = 8_000
@@ -36,13 +42,53 @@ class SessionState:
     messages: list[dict[str, Any]]
     requests: int = 0
     cost_usd: float = 0.0
+    failover_state: str = FailoverState.PRIMARY_ACTIVE
+    fallback_reason: str | None = None
+    next_quota_check: float | None = None
+    pending_operation_id: str | None = None
+    pending_request: str | None = None
+    last_operation_id: str | None = None
+    last_result: dict[str, Any] | None = None
 
 
 class SessionStore:
-    def __init__(self, max_sessions: int = 100):
+    def __init__(self, max_sessions: int = 100, path: Path | None = None):
         self._sessions: OrderedDict[str, SessionState] = OrderedDict()
         self._max_sessions = max_sessions
         self._lock = threading.Lock()
+        self.path = path
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path:
+            return
+        try:
+            if not self.path.is_file() or self.path.stat().st_size > 20_000_000:
+                return
+            document = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(document, dict):
+                return
+            for session_id, value in document.items():
+                if isinstance(value, dict) and isinstance(value.get("messages"), list):
+                    allowed = SessionState.__dataclass_fields__
+                    self._sessions[session_id] = SessionState(
+                        **{key: item for key, item in value.items() if key in allowed}
+                    )
+            while len(self._sessions) > self._max_sessions:
+                self._sessions.popitem(last=False)
+        except (OSError, ValueError, TypeError):
+            return
+
+    def _persist(self) -> None:
+        if not self.path:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps({key: asdict(value) for key, value in self._sessions.items()},
+                       ensure_ascii=False), encoding="utf-8"
+        )
+        os.replace(temporary, self.path)
 
     def get(self, session_id: str) -> SessionState:
         with self._lock:
@@ -51,20 +97,28 @@ class SessionStore:
                 self._sessions.move_to_end(session_id)
             if state is None:
                 return SessionState([])
-            return SessionState(list(state.messages), state.requests, state.cost_usd)
+            return SessionState(**{**asdict(state), "messages": list(state.messages)})
 
     def set(self, session_id: str, state: SessionState) -> None:
         with self._lock:
             self._sessions[session_id] = SessionState(
-                list(state.messages), state.requests, state.cost_usd
+                **{**asdict(state), "messages": list(state.messages)}
             )
             self._sessions.move_to_end(session_id)
             while len(self._sessions) > self._max_sessions:
                 self._sessions.popitem(last=False)
+            try:
+                self._persist()
+            except OSError:
+                raise AgentRuntimeError("SESSION_PERSIST_FAILED", "Chat state could not be saved safely.") from None
 
     def clear(self, session_id: str) -> None:
         with self._lock:
             self._sessions.pop(session_id, None)
+            try:
+                self._persist()
+            except OSError:
+                return
 
 
 class AppRuntime:
@@ -86,14 +140,32 @@ class AppRuntime:
             settings.validate()
         self.settings_store = SettingsStore(settings, settings_path)
         self.settings_store.load()
-        self.usage_logger = UsageLogger(usage_path or default_usage_log_path())
+        self.usage_path = usage_path or default_usage_log_path()
+        self.usage_logger = UsageLogger(self.usage_path)
         self.action_journal = ActionJournal(
-            action_log_path or default_usage_log_path().with_name("actions.jsonl")
+            action_log_path or self.usage_path.with_name("actions.jsonl")
         )
-        self.sessions = SessionStore()
+        self.sessions = SessionStore(path=self.usage_path.with_name("sessions.json"))
         self.tailscale_inspector = tailscale_inspector or TailscaleInspector()
         self._project_services: dict[str, ProjectService] = {}
         self._project_services_lock = threading.Lock()
+        self._chat_locks: dict[str, threading.Lock] = {}
+        self._chat_locks_guard = threading.Lock()
+        self._failover_budget_lock = threading.Lock()
+        self.codex_cli = shutil.which("codex")
+        self.codex_chatgpt_authenticated = self._codex_chatgpt_login()
+
+    def _codex_chatgpt_login(self) -> bool:
+        if not self.codex_cli:
+            return False
+        env = {key: value for key, value in os.environ.items()
+               if key not in {"OPENAI_API_KEY", "ACCESS_TOKEN", "OPENAI_ACCESS_TOKEN"}}
+        try:
+            check = subprocess.run([self.codex_cli, "login", "status"], capture_output=True,
+                                   text=True, encoding="utf-8", timeout=5, check=False, env=env)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return check.returncode == 0 and "Logged in using ChatGPT" in check.stdout + check.stderr
 
     def settings(self) -> AppSettings:
         return self.settings_store.get()
@@ -126,17 +198,46 @@ class AppRuntime:
     def tailscale_status(self) -> TailscaleExitStatus:
         return self.tailscale_inspector.inspect()
 
-    def chat(self, message: str, session_id: str) -> dict[str, Any]:
+    def chat(self, message: str, session_id: str, operation_id: str | None = None) -> dict[str, Any]:
+        with self._chat_locks_guard:
+            lock = self._chat_locks.setdefault(session_id, threading.Lock())
+        with lock:
+            with self._failover_budget_lock:
+                return self._chat_locked(message, session_id, operation_id or uuid.uuid4().hex)
+
+    def _chat_locked(self, message: str, session_id: str, operation_id: str) -> dict[str, Any]:
         settings = self.settings()
         egress = self.tailscale_status()
         self._validate_egress(settings, egress)
         key = self.api_key()
-        if settings.provider == "openrouter" and key is None:
-            raise AgentRuntimeError(
-                "API_KEY_MISSING",
-                "Set OPENROUTER_API_KEY in the backend environment before starting SAVVA.",
-            )
-        adapter = self._adapter(settings, key)
+        previous = self.sessions.get(session_id)
+        if previous.last_operation_id == operation_id and previous.last_result:
+            return previous.last_result
+        if previous.pending_operation_id and previous.pending_operation_id != operation_id:
+            raise AgentRuntimeError("OPERATION_PENDING", "Retry or reset the interrupted chat operation first.")
+        if previous.pending_operation_id == operation_id and previous.pending_request != message:
+            raise AgentRuntimeError("IDEMPOTENCY_CONFLICT", "Operation ID was already used for another message.")
+        previous.pending_operation_id = operation_id
+        previous.pending_request = message
+        self.sessions.set(session_id, previous)
+        fallback = self._adapter(settings, key)
+        primary = CodexAppServerAdapter(
+            workspace_root=settings.workspace_root,
+            model=settings.codex_model,
+        )
+        if not settings.failover_enabled:
+            primary = fallback
+        adapter = FailoverEngine(
+            primary, fallback,
+            session_cost_usd=previous.cost_usd,
+            task_budget_usd=settings.max_session_cost_usd,
+            daily_cost_usd=self.usage_logger.daily_cost(),
+            daily_budget_usd=settings.failover_daily_budget_usd,
+            max_request_cost_usd=settings.max_request_cost_usd,
+            state=previous.failover_state,
+            fallback_reason=previous.fallback_reason,
+            next_quota_check=previous.next_quota_check,
+        )
         project_service = self.project_service(settings.workspace_root)
         orchestrator = AgentOrchestrator(
             adapter=adapter,
@@ -151,32 +252,36 @@ class AppRuntime:
             usage_logger=self.usage_logger,
             project_service=project_service,
         )
-        previous = self.sessions.get(session_id)
-        result = orchestrator.run(
-            previous.messages,
-            message,
-            session_id=session_id,
-            initial_requests=previous.requests,
-            initial_cost_usd=previous.cost_usd,
-        )
-        self.sessions.set(
-            session_id,
-            SessionState(
-                messages=result.messages,
-                requests=result.usage["requests"],
-                cost_usd=result.usage["cost_usd"],
-            ),
-        )
-        return {
-            "status": "success",
-            "session_id": session_id,
-            "answer": result.answer,
-            "events": result.events,
-            "usage": result.usage,
-            "provider": settings.provider,
-            "model": settings.model,
-            "egress": egress.to_dict(),
-        }
+        try:
+            result = orchestrator.run(
+                previous.messages, message, session_id=session_id,
+                initial_requests=previous.requests, initial_cost_usd=previous.cost_usd,
+            )
+            response = {
+                "status": "success", "session_id": session_id,
+                "operation_id": operation_id,
+                "answer": result.answer, "events": result.events, "usage": result.usage,
+                "provider": adapter.provider, "model": adapter.model,
+                "egress": egress.to_dict(), **adapter.status(),
+            }
+            self.sessions.set(session_id, SessionState(
+                messages=result.messages, requests=result.usage["requests"],
+                cost_usd=result.usage["cost_usd"], failover_state=adapter.state.value,
+                fallback_reason=adapter.fallback_reason,
+                next_quota_check=adapter.next_quota_check,
+                last_operation_id=operation_id, last_result=response,
+            ))
+            return response
+        except (AgentRuntimeError, ModelAdapterError, BudgetExceeded):
+            self.sessions.set(session_id, SessionState(
+                **{**asdict(previous), "failover_state": adapter.state.value,
+                   "fallback_reason": adapter.fallback_reason,
+                   "next_quota_check": adapter.next_quota_check,
+                   "cost_usd": max(previous.cost_usd, adapter.session_cost_usd)}
+            ))
+            raise
+        finally:
+            adapter.close()
 
     @staticmethod
     def _validate_egress(
@@ -224,6 +329,26 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         try:
+            if path == "/api/session":
+                session_id = parse_qs(urlparse(self.path).query).get("session_id", [""])[0]
+                if not 8 <= len(session_id) <= 100:
+                    self._error(HTTPStatus.BAD_REQUEST, "INVALID_SESSION", "A valid session_id is required.")
+                    return
+                state = self.server.runtime.sessions.get(session_id)
+                history = [{"role": item["role"], "content": item["content"]}
+                           for item in state.messages[-100:]
+                           if item.get("role") in {"user", "assistant"}
+                           and isinstance(item.get("content"), str) and item["content"].strip()]
+                self._json(HTTPStatus.OK, {
+                    "session_id": session_id, "history": history,
+                    "active_provider": state.last_result.get("active_provider") if state.last_result else None,
+                    "active_model": state.last_result.get("active_model") if state.last_result else None,
+                    "fallback_reason": state.fallback_reason,
+                    "task_cost_usd": state.cost_usd,
+                    "pending_operation": bool(state.pending_operation_id),
+                    "operation_id": state.pending_operation_id or state.last_operation_id,
+                })
+                return
             if path == "/api/health":
                 settings = self.server.runtime.public_settings()
                 egress = self.server.runtime.tailscale_status()
@@ -234,6 +359,8 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
                         "provider": settings["provider"],
                         "model": settings["model"],
                         "api_key_configured": settings["api_key_configured"],
+                        "codex_cli_installed": bool(self.server.runtime.codex_cli),
+                        "codex_chatgpt_authenticated": self.server.runtime.codex_chatgpt_authenticated,
                         "workspace_root": settings["workspace_root"],
                         "require_tailscale_exit_node": settings[
                             "require_tailscale_exit_node"
@@ -328,6 +455,7 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/chat":
                 message = body.get("message")
                 session_id = body.get("session_id")
+                operation_id = body.get("operation_id")
                 if not isinstance(message, str) or not message.strip():
                     self._error(
                         HTTPStatus.BAD_REQUEST,
@@ -349,7 +477,12 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
                         "A valid session_id is required.",
                     )
                     return
-                result = self.server.runtime.chat(message.strip(), session_id)
+                if operation_id is not None and (not isinstance(operation_id, str)
+                        or not 8 <= len(operation_id) <= 100
+                        or any(not (char.isalnum() or char in "-_") for char in operation_id)):
+                    self._error(HTTPStatus.BAD_REQUEST, "INVALID_OPERATION_ID", "operation_id is invalid.")
+                    return
+                result = self.server.runtime.chat(message.strip(), session_id, operation_id)
                 self._json(HTTPStatus.OK, result)
                 return
             if path == "/api/reset":

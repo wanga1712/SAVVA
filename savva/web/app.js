@@ -1,5 +1,7 @@
 const state = {
-  sessionId: crypto.randomUUID(),
+  sessionId: localStorage.getItem("savva.sessionId") || crypto.randomUUID(),
+  pendingOperationId: localStorage.getItem("savva.pendingOperationId") || "",
+  pendingMessage: localStorage.getItem("savva.pendingMessage") || "",
   busy: false,
   settings: null,
   currentProposal: null,
@@ -56,6 +58,7 @@ async function api(path, options = {}) {
 
 async function initialize() {
   try {
+    localStorage.setItem("savva.sessionId", state.sessionId);
     const [health, tools, settings, network] = await Promise.all([
       api("/api/health"),
       api("/api/tools"),
@@ -66,6 +69,8 @@ async function initialize() {
     renderNetwork(network.tailscale);
     renderTools(tools.tools);
     applySettings(settings);
+    const session = await api(`/api/session?session_id=${encodeURIComponent(state.sessionId)}`);
+    renderHistory(session.history || []);
   } catch (error) {
     elements.connection.textContent = "Offline";
     elements.connection.className = "pill error";
@@ -84,10 +89,29 @@ function renderNetwork(tailscale) {
 }
 
 function renderHealth(health) {
-  const ready = health.api_key_configured || health.provider === "ollama";
-  elements.connection.textContent = ready ? "Agent ready" : "API key missing";
+  const ready = health.codex_chatgpt_authenticated || health.api_key_configured || health.provider === "ollama";
+  elements.connection.textContent = health.codex_chatgpt_authenticated
+    ? "Codex ready"
+    : ready ? "Agent ready" : "Login or API key needed";
   elements.connection.className = `pill ${ready ? "ready" : "error"}`;
   elements.connection.title = `${health.provider} · ${health.model}`;
+}
+
+function renderHistory(history) {
+  if (!history.length) return;
+  const welcome = elements.messages.querySelector(".welcome-card");
+  if (welcome) welcome.remove();
+  for (const item of history) {
+    if (item.role === "user") addUserMessage(item.content);
+    else if (item.role === "assistant") {
+      const shell = addAgentShell();
+      shell.thinking.remove();
+      const answer = document.createElement("div");
+      answer.className = "answer";
+      renderFormattedAnswer(answer, item.content);
+      shell.body.append(answer);
+    }
+  }
 }
 
 function renderTools(tools) {
@@ -182,6 +206,12 @@ function renderAgentResult(shell, result) {
     result.answer || "Модель не вернула текстовый ответ.",
   );
   shell.body.append(timeline, answer);
+  const usage = document.createElement("div");
+  usage.className = "usage-row";
+  const total = Number(result.task_cost_usd || result.usage?.cost_usd || 0);
+  usage.textContent = `${result.active_provider || result.provider || "model"} · ${result.active_model || result.model || ""} · total $${total.toFixed(6)}`;
+  if (result.fallback_reason) usage.textContent += ` · fallback: ${result.fallback_reason}`;
+  shell.body.append(usage);
   scrollToBottom();
 }
 
@@ -544,17 +574,34 @@ function scrollToBottom() {
 
 async function sendMessage(text) {
   if (state.busy || !text.trim()) return;
+  if (state.pendingOperationId && state.pendingMessage !== text) {
+    const answer = document.createElement("div");
+    answer.className = "answer";
+    answer.textContent = "Сначала повторите незавершённый запрос или начните новый чат.";
+    elements.messages.append(answer);
+    return;
+  }
   state.busy = true;
   elements.send.disabled = true;
   elements.input.value = "";
   addUserMessage(text);
   const shell = addAgentShell();
+  if (!state.pendingOperationId || state.pendingMessage !== text) {
+    state.pendingOperationId = crypto.randomUUID();
+    state.pendingMessage = text;
+    localStorage.setItem("savva.pendingOperationId", state.pendingOperationId);
+    localStorage.setItem("savva.pendingMessage", text);
+  }
   try {
     const result = await api("/api/chat", {
       method: "POST",
-      body: JSON.stringify({ message: text, session_id: state.sessionId }),
+      body: JSON.stringify({ message: text, session_id: state.sessionId, operation_id: state.pendingOperationId }),
     });
     renderAgentResult(shell, result);
+    localStorage.removeItem("savva.pendingOperationId");
+    localStorage.removeItem("savva.pendingMessage");
+    state.pendingOperationId = "";
+    state.pendingMessage = "";
   } catch (error) {
     shell.thinking.remove();
     const answer = document.createElement("div");
@@ -645,6 +692,11 @@ document.querySelector("#new-chat").addEventListener("click", async () => {
     body: JSON.stringify({ session_id: state.sessionId }),
   }).catch(() => {});
   state.sessionId = crypto.randomUUID();
+  state.pendingOperationId = "";
+  state.pendingMessage = "";
+  localStorage.setItem("savva.sessionId", state.sessionId);
+  localStorage.removeItem("savva.pendingOperationId");
+  localStorage.removeItem("savva.pendingMessage");
   elements.messages.replaceChildren();
   location.reload();
 });
