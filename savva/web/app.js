@@ -186,8 +186,11 @@ function renderAgentResult(shell, result) {
       const usage = document.createElement("div");
       usage.className = "usage-row";
       const cost = Number(event.cost_usd || 0);
+      const costBasis = event.provider === "codex_chatgpt" ? "ChatGPT subscription" :
+        event.provider === "ollama" ? "local" :
+        event.cost_verified ? "provider reported" : "estimate";
       usage.textContent =
-        `tokens ${event.total_tokens || 0} · cost $${cost.toFixed(6)} · ` +
+        `tokens ${event.total_tokens || 0} · ${costBasis} $${cost.toFixed(6)} · ` +
         `step ${event.step + 1}`;
       timeline.append(usage);
     }
@@ -210,6 +213,7 @@ function renderAgentResult(shell, result) {
   usage.className = "usage-row";
   const total = Number(result.task_cost_usd || result.usage?.cost_usd || 0);
   usage.textContent = `${result.active_provider || result.provider || "model"} · ${result.active_model || result.model || ""} · total $${total.toFixed(6)}`;
+  if (result.budget_limit_guaranteed === false) usage.textContent += " · estimated; provider billing may differ";
   if (result.fallback_reason) usage.textContent += ` · fallback: ${result.fallback_reason}`;
   shell.body.append(usage);
   scrollToBottom();

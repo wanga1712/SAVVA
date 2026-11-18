@@ -23,6 +23,8 @@ class UsageRecord:
     completion_tokens: int
     total_tokens: int
     cost_usd: float
+    cost_verified: bool
+    cost_estimated: bool
     duration_ms: int
     status: str
     tool_names: list[str]
@@ -45,6 +47,8 @@ class UsageLogger:
         completion_tokens: int = 0,
         total_tokens: int = 0,
         cost_usd: float = 0.0,
+        cost_verified: bool = False,
+        cost_estimated: bool = False,
         duration_ms: int = 0,
         status: str = "success",
         tool_names: list[str] | None = None,
@@ -59,6 +63,8 @@ class UsageLogger:
             completion_tokens=max(0, int(completion_tokens or 0)),
             total_tokens=max(0, int(total_tokens or 0)),
             cost_usd=max(0.0, float(cost_usd or 0.0)),
+            cost_verified=bool(cost_verified),
+            cost_estimated=bool(cost_estimated),
             duration_ms=max(0, int(duration_ms)),
             status=status,
             tool_names=list(tool_names or []),
@@ -85,10 +91,12 @@ class UsageLogger:
                 for line in stream:
                     try:
                         item = json.loads(line)
-                    except json.JSONDecodeError:
+                        timestamp = float(item.get("timestamp_unix", 0))
+                        cost = float(item.get("cost_usd", 0))
+                    except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
                         return float("inf")
-                    if float(item.get("timestamp_unix", 0)) >= day_start:
-                        total += max(0.0, float(item.get("cost_usd", 0)))
+                    if timestamp >= day_start:
+                        total += max(0.0, cost)
         except FileNotFoundError:
             return 0.0
         except OSError:
@@ -97,10 +105,18 @@ class UsageLogger:
 
 
 class BudgetExceeded(RuntimeError):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, *, cost_usd: float = 0.0,
+                 cost_verified: bool = False, cost_estimated: bool = False,
+                 provider: str | None = None,
+                 model: str | None = None):
         super().__init__(message)
         self.code = code
         self.safe_message = message
+        self.cost_usd = max(0.0, float(cost_usd))
+        self.cost_verified = cost_verified
+        self.cost_estimated = cost_estimated
+        self.provider = provider
+        self.model = model
 
 
 class RunBudget:

@@ -87,8 +87,11 @@ the primary chat provider and the configured OpenRouter/Ollama adapter as its
 fallback. Failover requires a confirmed Codex quota limit; authentication,
 configuration, timeout, and transient errors do not trigger paid fallback.
 Fallback requests require public model pricing and stay within the per-request,
-per-session, and daily budget guards. Chat sessions and unfinished operation IDs
-are saved locally in `%LOCALAPPDATA%\SAVVA\sessions.json`.
+per-session, and daily preflight budgets. SAVVA reserves each estimate before a
+request and reconciles provider-reported cost or token usage against the rate
+card. Provider pricing and billing can change, so these estimates are not a
+guaranteed hard billing cap. Chat sessions and unfinished operation IDs are
+saved locally in `%LOCALAPPDATA%\SAVVA\sessions.json`.
 | `SAVVA_EXPECTED_EXIT_NODE` | empty |
 
 For a future Ollama run, select `ollama` and use a loopback OpenAI-compatible

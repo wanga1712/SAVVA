@@ -199,12 +199,15 @@ class AgentOrchestrator:
                 max_tokens=self.max_tokens,
                 timeout_seconds=timeout_seconds,
             )
-        except Exception:
+        except Exception as exc:
             self.usage_logger.record(
                 session_id=session_id,
-                provider=self.adapter.provider,
-                model=self.adapter.model,
+                provider=getattr(exc, "provider", self.adapter.provider),
+                model=getattr(exc, "model", self.adapter.model),
                 duration_ms=round((time.perf_counter() - started) * 1000),
+                cost_usd=getattr(exc, "cost_usd", 0.0),
+                cost_verified=getattr(exc, "cost_verified", False),
+                cost_estimated=getattr(exc, "cost_estimated", False),
                 status="error",
                 tool_names=tool_names,
             )
@@ -217,6 +220,8 @@ class AgentOrchestrator:
             completion_tokens=response.usage.completion_tokens,
             total_tokens=response.usage.total_tokens,
             cost_usd=response.usage.cost_usd,
+            cost_verified=response.usage.cost_verified,
+            cost_estimated=response.usage.cost_estimated,
             duration_ms=round((time.perf_counter() - started) * 1000),
             status="success",
             tool_names=tool_names,
@@ -359,19 +364,22 @@ class AgentOrchestrator:
             reverse[alias] = name
         return aliases, reverse
 
-    @staticmethod
     def _model_events(
-        response: ModelResponse, step_index: int
+        self, response: ModelResponse, step_index: int
     ) -> list[dict[str, Any]]:
         return [
             {
                 "type": "model_usage",
                 "step": step_index,
+                "provider": self.adapter.provider,
+                "model": self.adapter.model,
                 "request_id": response.request_id,
                 "prompt_tokens": response.usage.prompt_tokens,
                 "completion_tokens": response.usage.completion_tokens,
                 "total_tokens": response.usage.total_tokens,
                 "cost_usd": response.usage.cost_usd,
+                "cost_verified": response.usage.cost_verified,
+                "cost_estimated": response.usage.cost_estimated,
                 "finish_reason": response.finish_reason,
             }
         ]

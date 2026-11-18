@@ -82,3 +82,37 @@ Implemented in this WIP:
 Authorization was verified locally using `codex login status` (ChatGPT sign-in) and App Server `account/rateLimits/read`; the response exposed a Plus plan and primary/secondary quota windows. A prior real inference attempt returned no captured result, so successful real generation through App Server remains unconfirmed. No reset credits were redeemed. Automated fallback requests were mocked; API spend for tests was $0.00.
 
 Targeted tests passed before the latest integration edits: `test_server.py` (8), `test_failover.py` (6), and `test_workflow.py` (3). The full suite and post-edit tests remain pending. Secret-history scanning, commit, and push remain pending. No merge or deployment was performed. This is an incremental failover implementation, not completion of all original SAVVA-004 development-orchestrator acceptance scenarios: arbitrary project execution and real test/repair workflow remain outside this WIP.
+
+## SAVVA-004-FAILOVER-002 — review repairs and acceptance (2026-11-18)
+
+### Git baseline
+
+- `main` is the original local baseline `1bf35f8f0a0ce170a2d7edad167e15b14fae8ff8`. At the start of this WIP, GitHub had no `main` ref (its only branch was the already pushed WIP-001 branch); this WIP publishes the unchanged local base commit to `main` with a non-force push.
+- Work is isolated on `wip/SAVVA-004-FAILOVER-002`, created from the pushed WIP-001 head. No merge or force-push is planned.
+
+### Repairs
+
+- `savva/agent/codex_app_server.py`: one persistent stdout reader now dispatches JSON-RPC responses by ID and app-server requests/notifications into an event queue. Reader EOF wakes pending RPC callers; bounded RPC/turn waits and process cleanup remain in effect. Method-bearing messages with IDs (server requests such as dynamic tool calls) are treated as events, not replies.
+- `savva/agent/failover.py`: quota monitoring now returns AVAILABLE, EXHAUSTED, or UNKNOWN. During fallback, UNKNOWN retains fallback and schedules a bounded retry. Any exhausted primary/secondary window across any limit bucket keeps GPT unavailable; the next probe is scheduled at the latest exhausted reset time.
+- `savva/agent/models.py`, `savva/agent/usage.py`, `savva/agent/orchestrator.py`: preflight pricing includes full message history/system messages, tool schemas, request envelope, and max output tokens. Unknown or invalid pricing blocks paid calls. The rate-card estimate is reserved before request, then reconciled with provider cost or token counts when available. Reservations survive ambiguous request failures. Usage entries distinguish provider-verified cost from estimates. API status explicitly reports `budget_limit_guaranteed: false`; provider billing may differ from preflight estimates.
+- `tests/test_codex_app_server.py`, `tests/test_failover.py`, `tests/test_budget.py`, `tests/test_usage.py`, `tests/test_provider_errors.py`, `tests/test_server.py`: added dispatcher race/EOF/dynamic-tool, unknown quota, multi-window, pricing, reservation, 401/403/429/503/timeout, restart and completed-operation idempotency cases.
+
+Protocol references checked: [Codex App Server rate-limit protocol](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/account.rs) and [Codex error classifications](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/error.rs).
+
+### Live results (real providers)
+
+- `codex login status`: succeeded and identified ChatGPT authorization.
+- `account/rateLimits/read`: plan reported as `plus`; quota status AVAILABLE before generation.
+- One real App Server generation returned the expected `SAVVA-004-LIVE-OK` marker. Thread created; final turn and token usage received in 5.79 seconds; total tokens reported: 13,280. App Server process exited after close. No local session contents or credentials were inspected or printed. This consumed ChatGPT subscription quota; no API dollars were charged by this GPT call.
+- Real OpenRouter fallback request: SKIPPED. Runtime provider/model were OpenRouter / `nvidia/nemotron-3.5-lightning:free`, but no OpenRouter key was configured. No paid inference request was sent. Daily API spend before the conditional test was `$0.00`.
+
+### Mock/regression results
+
+- Mock dispatcher confirms `turn/completed` arriving after the `turn/start` RPC response is not lost; dynamic tool call dispatch and process EOF unblocking also pass.
+- Mock quota tests confirm fallback entry, UNKNOWN hold, primary recovery at the next boundary, longest exhausted window handling, context preservation, and budget blocks.
+- Error tests confirm 401, 403, generic 429, 503 and timeout do not cause quota failover. Completed operation replay after runtime restart returns its cached result without calling a model again.
+- Required full suite: `python -m unittest discover -s tests -v` — PASS, 70 tests (2026-11-18).
+
+### Remaining acceptance gap
+
+The real OpenRouter failover call and reconciliation with an actual provider charge remain unverified because the key is absent. Budget checks are conservative preflight plus reservation/reconciliation, not a mathematically guaranteed provider billing cap. The real GPT call used 13,280 total tokens, so the live check was successful but larger in token usage than the short visible prompt suggests.

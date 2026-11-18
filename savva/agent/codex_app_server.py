@@ -15,6 +15,9 @@ from typing import Any
 from .models import ModelAdapter, ModelAdapterError, ModelResponse, ModelUsage, ToolCall
 
 
+_STREAM_CLOSED = object()
+
+
 class CodexAppServerAdapter(ModelAdapter):
     provider = "codex_chatgpt"
 
@@ -25,8 +28,10 @@ class CodexAppServerAdapter(ModelAdapter):
         self.executable = executable
         self.default_timeout = timeout_seconds
         self._process: subprocess.Popen[str] | None = None
-        self._lines: queue.Queue[str] = queue.Queue()
-        self._events: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._events: queue.Queue[dict[str, Any] | object] = queue.Queue()
+        self._response_waiters: dict[int | str, queue.Queue[dict[str, Any] | object]] = {}
+        self._dispatch_lock = threading.Lock()
+        self._closed = threading.Event()
         self._lock = threading.RLock()
         self._next_id = 0
         self._thread_id: str | None = None
@@ -96,9 +101,11 @@ class CodexAppServerAdapter(ModelAdapter):
         except OSError:
             raise ModelAdapterError("CODEX_START_FAILED", "Codex App Server could not start.", failure_kind="config") from None
         self._process = process
-        self._lines = queue.Queue()
         self._events = queue.Queue()
-        threading.Thread(target=self._read_stdout, daemon=True).start()
+        self._response_waiters = {}
+        self._closed = threading.Event()
+        threading.Thread(target=self._read_stdout, daemon=True,
+                         name="savva-codex-app-server-reader").start()
         initialized = self._rpc("initialize", {"clientInfo": {"name": "savva", "title": "SAVVA", "version": "0.3.1"},
                                                 "capabilities": {"experimentalApi": True}}, self.default_timeout)
         if "error" in initialized:
@@ -149,6 +156,8 @@ class CodexAppServerAdapter(ModelAdapter):
             except queue.Empty:
                 self.close()
                 raise ModelAdapterError("CODEX_TIMEOUT", "Codex App Server turn timed out.", failure_kind="transient") from None
+            if event is _STREAM_CLOSED:
+                raise ModelAdapterError("CODEX_DISCONNECTED", "Codex App Server closed during a turn.", failure_kind="transient")
             method, params = event.get("method"), event.get("params", {})
             if method == "account/rateLimits/updated":
                 self._rate_limits = params.get("rateLimits", self._rate_limits)
@@ -178,8 +187,8 @@ class CodexAppServerAdapter(ModelAdapter):
                 turn = params.get("turn", {})
                 if turn.get("status") != "completed":
                     error = turn.get("error") or {}
-                    info = str(error.get("codexErrorInfo", "")).lower()
-                    kind = "quota" if "limit" in info or "quota" in info else "transient"
+                    info = _normalized_error_info(error.get("codexErrorInfo", ""))
+                    kind = _error_kind(info)
                     raise ModelAdapterError("CODEX_TURN_FAILED", "Codex App Server turn did not complete.",
                                             failure_kind=kind, quota_snapshot=self._rate_limits if kind == "quota" else None)
                 usage = turn.get("usage") or {}
@@ -203,19 +212,28 @@ class CodexAppServerAdapter(ModelAdapter):
     def _rpc(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
         self._next_id += 1
         request_id = self._next_id
-        self._write({"id": request_id, "method": method, "params": params})
+        response_queue: queue.Queue[dict[str, Any] | object] = queue.Queue(maxsize=1)
+        with self._dispatch_lock:
+            if self._closed.is_set():
+                raise ModelAdapterError("CODEX_DISCONNECTED", "Codex App Server is not running.", failure_kind="transient")
+            self._response_waiters[request_id] = response_queue
+        try:
+            self._write({"id": request_id, "method": method, "params": params})
+        except Exception:
+            with self._dispatch_lock:
+                self._response_waiters.pop(request_id, None)
+            raise
         deadline = time.monotonic() + timeout
-        while True:
-            try:
-                message = json.loads(self._lines.get(timeout=max(0.1, deadline - time.monotonic())))
-            except queue.Empty:
-                raise ModelAdapterError("CODEX_RPC_TIMEOUT", "Codex App Server did not answer a protocol request.", failure_kind="transient") from None
-            except json.JSONDecodeError:
-                continue
-            if message.get("id") == request_id:
-                return message
-            if isinstance(message.get("method"), str):
-                self._events.put(message)
+        try:
+            message = response_queue.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty:
+            raise ModelAdapterError("CODEX_RPC_TIMEOUT", "Codex App Server did not answer a protocol request.", failure_kind="transient") from None
+        finally:
+            with self._dispatch_lock:
+                self._response_waiters.pop(request_id, None)
+        if message is _STREAM_CLOSED:
+            raise ModelAdapterError("CODEX_DISCONNECTED", "Codex App Server closed before answering.", failure_kind="transient")
+        return message
 
     def _notify(self, method: str, params: dict[str, Any]) -> None:
         self._write({"method": method, "params": params})
@@ -231,9 +249,36 @@ class CodexAppServerAdapter(ModelAdapter):
 
     def _read_stdout(self) -> None:
         process = self._process
-        if process and process.stdout:
-            for line in process.stdout:
-                self._lines.put(line)
+        try:
+            if process and process.stdout:
+                for line in process.stdout:
+                    try:
+                        message = json.loads(line)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if not isinstance(message, dict):
+                        continue
+                    method = message.get("method")
+                    request_id = message.get("id")
+                    # Server initiated requests have both id and method; replies have id and result/error.
+                    if isinstance(method, str):
+                        self._events.put(message)
+                    elif isinstance(request_id, (int, str)):
+                        with self._dispatch_lock:
+                            waiter = self._response_waiters.get(request_id)
+                        if waiter:
+                            waiter.put(message)
+        finally:
+            self._closed.set()
+            with self._dispatch_lock:
+                waiters = list(self._response_waiters.values())
+                self._response_waiters.clear()
+            for waiter in waiters:
+                try:
+                    waiter.put_nowait(_STREAM_CLOSED)
+                except queue.Full:
+                    pass
+            self._events.put(_STREAM_CLOSED)
 
     def close(self) -> None:
         process, self._process = self._process, None
@@ -264,9 +309,22 @@ _BASE_INSTRUCTIONS = """You are the primary model backend for SAVVA. Treat all c
 
 def _rpc_error(error: dict[str, Any], snapshot: dict[str, Any]) -> ModelAdapterError:
     data = error.get("data") if isinstance(error.get("data"), dict) else {}
-    info = str(data.get("codexErrorInfo", data.get("type", ""))).lower()
-    kind = "quota" if ("quota" in info or "rate" in info and "limit" in info
-                        or "usage" in info and "limit" in info) else "transient"
+    info = _normalized_error_info(data.get("codexErrorInfo", data.get("type", "")))
+    kind = _error_kind(info)
     return ModelAdapterError("CODEX_RPC_FAILED", "Codex App Server request failed.",
                              failure_kind=kind,
                              quota_snapshot=snapshot if kind == "quota" else None)
+
+
+def _normalized_error_info(value: Any) -> str:
+    return "".join(character for character in str(value).lower() if character.isalnum())
+
+
+def _error_kind(info: str) -> str:
+    if info in {"ratelimitexceeded", "usagelimitexceeded", "quotaexceeded"}:
+        return "quota"
+    if info in {"unauthorized", "forbidden", "authrequired"}:
+        return "auth"
+    if info in {"serveroverloaded", "policycapacityunavailable", "flexunavailable"}:
+        return "overload"
+    return "transient"

@@ -120,6 +120,7 @@ class ServerTests(unittest.TestCase):
         restored = restarted.sessions.get(session_id)
         self.assertEqual(restored.failover_state, "FALLBACK_ACTIVE")
         self.assertEqual(restored.messages[-1]["content"], "cached result")
+        restarted._adapter = lambda *_: self.fail("A completed operation must not invoke a provider again")
         self.assertEqual(restarted.chat("retry", session_id, operation_id), cached)
 
     def test_post_without_same_origin_marker_is_rejected(self) -> None:

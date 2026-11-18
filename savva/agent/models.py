@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 import urllib.error
@@ -34,6 +35,9 @@ class ModelUsage:
     completion_tokens: int = 0
     total_tokens: int = 0
     cost_usd: float = 0.0
+    cost_verified: bool = False
+    cost_estimated: bool = False
+    token_counts_verified: bool = False
 
 
 @dataclass(slots=True)
@@ -183,14 +187,21 @@ class OpenAICompatibleAdapter(ModelAdapter):
         self._transport = transport or UrllibJsonTransport()
         self._last_price: tuple[float, float] | None = None
 
-    def max_cost_estimate(self, messages: list[dict[str, Any]], max_tokens: int) -> float:
-        if self.provider != "openrouter":
+    def max_cost_estimate(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+                          max_tokens: int) -> float:
+        if self.provider == "ollama":
             return 0.0
+        if self.provider != "openrouter":
+            raise ModelAdapterError("MODEL_PRICE_UNAVAILABLE", "Fallback pricing is not configured.", failure_kind="protocol")
         prompt_price, completion_price = _openrouter_model_price(self.base_url, self.model)
+        if any(not math.isfinite(value) or value < 0 for value in (prompt_price, completion_price)):
+            raise ModelAdapterError("MODEL_PRICE_INVALID", "Fallback pricing is invalid.", failure_kind="protocol")
         self._last_price = (prompt_price, completion_price)
-        prompt_bytes = len(json.dumps(messages, ensure_ascii=False).encode("utf-8")) + 4096
-        upper_bound = prompt_bytes * prompt_price + max_tokens * completion_price
-        return upper_bound * 1.25
+        request_shape = {"messages": messages, "tools": tools, "max_tokens": max_tokens,
+                         "temperature": 0.1, "tool_choice": "auto" if tools else None}
+        prompt_bytes = len(json.dumps(request_shape, ensure_ascii=False,
+                                      separators=(",", ":")).encode("utf-8")) + 2048
+        return (prompt_bytes * prompt_price + max_tokens * completion_price) * 2.0
 
     def complete(
         self,
@@ -232,12 +243,14 @@ class OpenAICompatibleAdapter(ModelAdapter):
             timeout_seconds,
         )
         result = self._parse_response(document)
-        if self.provider == "openrouter" and result.usage.cost_usd == 0 and self._last_price:
+        if (self.provider == "openrouter" and not result.usage.cost_verified
+                and result.usage.token_counts_verified and self._last_price):
             prompt_price, completion_price = self._last_price
             result.usage.cost_usd = (
                 result.usage.prompt_tokens * prompt_price
                 + result.usage.completion_tokens * completion_price
             )
+            result.usage.cost_estimated = True
         return result
 
     def _completion_url(self) -> str:
@@ -302,11 +315,24 @@ class OpenAICompatibleAdapter(ModelAdapter):
             )
         usage_document = document.get("usage")
         usage_document = usage_document if isinstance(usage_document, dict) else {}
+        provider_cost = usage_document.get("cost")
+        try:
+            parsed_provider_cost = float(provider_cost) if provider_cost is not None else 0.0
+        except (TypeError, ValueError):
+            parsed_provider_cost = float("nan")
+        cost_verified = provider_cost is not None and math.isfinite(parsed_provider_cost) and parsed_provider_cost >= 0
+        if not cost_verified:
+            parsed_provider_cost = 0.0
         usage = ModelUsage(
             prompt_tokens=int(usage_document.get("prompt_tokens") or 0),
             completion_tokens=int(usage_document.get("completion_tokens") or 0),
             total_tokens=int(usage_document.get("total_tokens") or 0),
-            cost_usd=float(usage_document.get("cost") or 0.0),
+            cost_usd=parsed_provider_cost,
+            cost_verified=cost_verified,
+            token_counts_verified=("prompt_tokens" in usage_document and
+                                   "completion_tokens" in usage_document and
+                                   int(usage_document.get("prompt_tokens") or 0) >= 0 and
+                                   int(usage_document.get("completion_tokens") or 0) >= 0),
         )
         return ModelResponse(
             content=str(content or "").strip(),
@@ -384,10 +410,10 @@ def _openrouter_model_price(base_url: str, model: str) -> tuple[float, float]:
         item = next(value for value in entries if value.get("id") == model)
         pricing = item["pricing"]
         prompt, completion = float(pricing["prompt"]), float(pricing["completion"])
-        if prompt < 0 or completion < 0:
+        if not math.isfinite(prompt) or not math.isfinite(completion) or prompt < 0 or completion < 0:
             raise ValueError("negative model price")
     except (UnicodeError, ValueError, KeyError, TypeError, StopIteration):
         raise ModelAdapterError("MODEL_PRICE_INVALID", "Fallback model pricing is unavailable or invalid.", failure_kind="protocol") from None
     with _MODEL_PRICE_LOCK:
-        _MODEL_PRICE_CACHE[key] = (prompt, completion, time.time() + 600)
+        _MODEL_PRICE_CACHE[key] = (prompt, completion, time.time() + 60)
     return prompt, completion
