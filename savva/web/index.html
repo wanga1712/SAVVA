@@ -108,10 +108,24 @@
       </div>
 
       <div class="key-notice">
-        API key is read only from the backend environment variable
-        <code>OPENROUTER_API_KEY</code>. It is never returned to this page.
+        API keys are stored by the backend using Windows DPAPI or read from
+        <code>OPENROUTER_API_KEY</code>. The key is never returned to this page.
         <span id="key-status"></span>
       </div>
+      <section class="key-management" aria-label="OpenRouter API key">
+        <label>OpenRouter inference API key
+          <input id="openrouter-key-input" type="password" maxlength="4096"
+            autocomplete="new-password" spellcheck="false" placeholder="Enter key locally">
+        </label>
+        <div class="dialog-actions key-actions">
+          <button id="store-openrouter-key" class="button primary" type="button">Store securely</button>
+          <button id="check-openrouter-key" class="button ghost" type="button">Check key and limit</button>
+          <button id="discover-openrouter-models" class="button ghost" type="button">Discover models</button>
+          <button id="delete-openrouter-key" class="button ghost" type="button">Delete stored key</button>
+        </div>
+        <p id="openrouter-key-result" class="muted-note" role="status"></p>
+        <pre id="model-discovery-output" class="code-viewer model-discovery-output" aria-live="polite"></pre>
+      </section>
 
       <div class="form-grid">
         <label>Provider

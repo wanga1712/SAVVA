@@ -23,6 +23,34 @@ class FakeTailscaleInspector:
         return self.status
 
 
+class MemorySecretStore:
+    def __init__(self) -> None:
+        self.value: str | None = None
+
+    def get(self) -> str | None:
+        return self.value
+
+    def set(self, value: str) -> None:
+        self.value = value
+
+    def delete(self) -> None:
+        self.value = None
+
+
+class FakeOpenRouterClient:
+    def key_status(self, api_key: str) -> dict[str, object]:
+        if api_key == "bad-test-key":
+            from savva.agent.openrouter import OpenRouterError
+            raise OpenRouterError("AUTH_FAILED", "OpenRouter rejected this API key.")
+        return {
+            "limit": 3, "limit_remaining": 2.75,
+            "is_management_key": api_key == "management-test-key",
+        }
+
+    def discover_models(self, api_key: str) -> dict[str, object]:
+        return {"catalog_count": 1, "models": [{"model_id": "example/catalog"}]}
+
+
 class ServerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -55,6 +83,8 @@ class ServerTests(unittest.TestCase):
             usage_path=root / "usage.jsonl",
             action_log_path=root / "actions.jsonl",
             tailscale_inspector=self.tailscale,
+            secret_store=MemorySecretStore(),
+            openrouter_client=FakeOpenRouterClient(),
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -98,6 +128,60 @@ class ServerTests(unittest.TestCase):
         error = json.loads(raised.exception.read().decode("utf-8"))
 
         self.assertEqual(error["error"]["code"], "API_KEY_MISSING")
+
+    def test_openrouter_key_is_stored_without_echo_or_settings_persistence(self) -> None:
+        secret = "sk-or-test-unique-secret-not-for-output"
+        request = urllib.request.Request(
+            self.base_url + "/api/openrouter/key",
+            data=json.dumps({"api_key": secret}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-SAVVA-Request": "1"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = response.read().decode("utf-8")
+        self.assertNotIn(secret, body)
+        self.assertEqual(self.server.runtime.api_key(), secret)
+        self.assertNotIn(secret, (Path(self.temporary.name) / "settings.json").read_text(encoding="utf-8") if (Path(self.temporary.name) / "settings.json").exists() else "")
+
+        with urllib.request.urlopen(self.base_url + "/api/openrouter/key-status", timeout=5) as response:
+            status = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(status["source"], "windows_dpapi")
+        self.assertNotIn(secret, json.dumps(status))
+
+    def test_openrouter_account_check_and_catalog_are_read_only(self) -> None:
+        self.server.runtime.secret_store.set("good-test-key")
+        with urllib.request.urlopen(self.base_url + "/api/openrouter/key-check", timeout=5) as response:
+            account = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(account["key"]["limit_remaining"], 2.75)
+        with urllib.request.urlopen(self.base_url + "/api/openrouter/models", timeout=5) as response:
+            catalog = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(catalog["catalog_count"], 1)
+        self.assertNotIn("good-test-key", json.dumps(account) + json.dumps(catalog))
+
+    def test_management_key_is_rejected_and_bad_auth_is_classified(self) -> None:
+        self.server.runtime.secret_store.set("management-test-key")
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(self.base_url + "/api/openrouter/key-check", timeout=5)
+        response = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual(response["error"]["code"], "MANAGEMENT_KEY_NOT_ALLOWED")
+
+        self.server.runtime.secret_store.set("bad-test-key")
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(self.base_url + "/api/openrouter/key-check", timeout=5)
+        response = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual(raised.exception.code, 401)
+        self.assertEqual(response["error"]["code"], "AUTH_FAILED")
+        self.assertNotIn("bad-test-key", json.dumps(response))
+
+    def test_openrouter_key_delete_requires_explicit_endpoint(self) -> None:
+        self.server.runtime.secret_store.set("stored-test-key")
+        request = urllib.request.Request(
+            self.base_url + "/api/openrouter/key/delete", data=b"{}",
+            headers={"Content-Type": "application/json", "X-SAVVA-Request": "1"}, method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            status = json.loads(response.read().decode("utf-8"))
+        self.assertFalse(status["key"]["configured"])
 
     def test_post_without_same_origin_marker_is_rejected(self) -> None:
         request = urllib.request.Request(

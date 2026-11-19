@@ -20,8 +20,10 @@ from .agent.config import (
     default_usage_log_path,
     settings_from_environment,
 )
+from .agent.credentials import SecretStoreError, WindowsDPAPISecretStore
 from .agent.models import ModelAdapterError, OllamaAdapter, OpenRouterAdapter
 from .agent.network import TailscaleExitStatus, TailscaleInspector
+from .agent.openrouter import OpenRouterAccountClient, OpenRouterError
 from .agent.orchestrator import AgentOrchestrator, AgentRuntimeError
 from .agent.projects import ActionJournal, ProjectService
 from .agent.tools import build_agent_registry
@@ -75,6 +77,8 @@ class AppRuntime:
         usage_path: Path | None = None,
         action_log_path: Path | None = None,
         tailscale_inspector: TailscaleInspector | None = None,
+        secret_store: Any | None = None,
+        openrouter_client: OpenRouterAccountClient | None = None,
     ):
         self.project_root = project_root or Path(__file__).resolve().parent.parent
         try:
@@ -86,6 +90,8 @@ class AppRuntime:
             settings.validate()
         self.settings_store = SettingsStore(settings, settings_path)
         self.settings_store.load()
+        self.secret_store = secret_store or WindowsDPAPISecretStore()
+        self.openrouter_client = openrouter_client or OpenRouterAccountClient()
         self.usage_logger = UsageLogger(usage_path or default_usage_log_path())
         self.action_journal = ActionJournal(
             action_log_path or default_usage_log_path().with_name("actions.jsonl")
@@ -102,12 +108,64 @@ class AppRuntime:
         if self.settings().provider != "openrouter":
             return None
         value = os.environ.get("OPENROUTER_API_KEY", "").strip()
-        return value or None
+        if value:
+            return value
+        try:
+            return self.secret_store.get()
+        except SecretStoreError:
+            return None
+
+    def api_key_status(self) -> dict[str, Any]:
+        environment_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+        stored_key = None
+        store_error = None
+        try:
+            stored_key = self.secret_store.get()
+        except SecretStoreError as exc:
+            store_error = exc.code
+        return {
+            "configured": bool(environment_key or stored_key),
+            "source": "environment" if environment_key else ("windows_dpapi" if stored_key else None),
+            "environment_managed": bool(environment_key),
+            "storage_error": store_error,
+        }
+
+    def set_api_key(self, value: str) -> dict[str, Any]:
+        if os.environ.get("OPENROUTER_API_KEY", "").strip():
+            raise SecretStoreError(
+                "ENVIRONMENT_KEY_ACTIVE",
+                "OPENROUTER_API_KEY is managed by the backend environment; remove it there before replacing the key in SAVVA.",
+            )
+        self.secret_store.set(value)
+        return self.api_key_status()
+
+    def delete_api_key(self) -> dict[str, Any]:
+        self.secret_store.delete()
+        return self.api_key_status()
+
+    def check_openrouter_key(self) -> dict[str, Any]:
+        key = self.api_key()
+        if key is None:
+            raise OpenRouterError("API_KEY_MISSING", "OpenRouter API key is not configured.")
+        status = self.openrouter_client.key_status(key)
+        if status.get("is_management_key"):
+            raise OpenRouterError(
+                "MANAGEMENT_KEY_NOT_ALLOWED",
+                "Management keys are not accepted for model access. Use an inference API key.",
+            )
+        return status
+
+    def discover_openrouter_models(self) -> dict[str, Any]:
+        key = self.api_key()
+        if key is None:
+            raise OpenRouterError("API_KEY_MISSING", "OpenRouter API key is not configured.")
+        return self.openrouter_client.discover_models(key)
 
     def public_settings(self) -> dict[str, Any]:
         result = self.settings().to_public_dict()
-        result["api_key_configured"] = self.api_key() is not None
-        result["api_key_source"] = "OPENROUTER_API_KEY"
+        key_status = self.api_key_status()
+        result["api_key_configured"] = key_status["configured"]
+        result["api_key_source"] = key_status["source"]
         return result
 
     def tools(self) -> list[dict[str, Any]]:
@@ -246,6 +304,17 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/settings":
                 self._json(HTTPStatus.OK, self.server.runtime.public_settings())
                 return
+            if path == "/api/openrouter/key-status":
+                self._json(HTTPStatus.OK, self.server.runtime.api_key_status())
+                return
+            if path == "/api/openrouter/key-check":
+                status = self.server.runtime.check_openrouter_key()
+                self._json(HTTPStatus.OK, {"status": "success", "key": status})
+                return
+            if path == "/api/openrouter/models":
+                result = self.server.runtime.discover_openrouter_models()
+                self._json(HTTPStatus.OK, {"status": "success", **result})
+                return
             if path == "/api/tools":
                 self._json(
                     HTTPStatus.OK,
@@ -308,6 +377,9 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
                 self._static("styles.css", "text/css; charset=utf-8")
                 return
             self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Resource not found.")
+        except (SecretStoreError, OpenRouterError) as exc:
+            status = HTTPStatus.UNAUTHORIZED if exc.code in {"AUTH_FAILED", "API_KEY_MISSING"} else HTTPStatus.BAD_REQUEST
+            self._error(status, exc.code, exc.safe_message)
         except Exception:
             self._error(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -324,6 +396,18 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
                 public = settings.to_public_dict()
                 public["api_key_configured"] = self.server.runtime.api_key() is not None
                 self._json(HTTPStatus.OK, {"status": "success", "settings": public})
+                return
+            if path == "/api/openrouter/key":
+                value = body.get("api_key")
+                if not isinstance(value, str):
+                    self._error(HTTPStatus.BAD_REQUEST, "API_KEY_INVALID", "Enter a valid OpenRouter API key.")
+                    return
+                status = self.server.runtime.set_api_key(value)
+                self._json(HTTPStatus.OK, {"status": "success", "key": status})
+                return
+            if path == "/api/openrouter/key/delete":
+                status = self.server.runtime.delete_api_key()
+                self._json(HTTPStatus.OK, {"status": "success", "key": status})
                 return
             if path == "/api/chat":
                 message = body.get("message")
@@ -411,6 +495,9 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.FORBIDDEN, "ORIGIN_DENIED", str(exc))
         except (AgentRuntimeError, ModelAdapterError) as exc:
             self._error(HTTPStatus.BAD_GATEWAY, exc.code, exc.safe_message)
+        except (SecretStoreError, OpenRouterError) as exc:
+            status = HTTPStatus.UNAUTHORIZED if exc.code in {"AUTH_FAILED", "API_KEY_MISSING"} else HTTPStatus.BAD_REQUEST
+            self._error(status, exc.code, exc.safe_message)
         except Exception:
             self._error(
                 HTTPStatus.INTERNAL_SERVER_ERROR,

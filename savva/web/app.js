@@ -617,6 +617,78 @@ async function saveSettings() {
   }
 }
 
+async function refreshOpenRouterKeyStatus() {
+  try {
+    const result = await api("/api/openrouter/key-status");
+    const source = result.source === "environment" ? "backend environment"
+      : result.source === "windows_dpapi" ? "Windows DPAPI" : "not configured";
+    elements.keyStatus.textContent = ` OpenRouter key: ${source}.`;
+  } catch (error) {
+    elements.keyStatus.textContent = ` Key status unavailable (${error.code}).`;
+  }
+}
+
+async function storeOpenRouterKey() {
+  const input = document.querySelector("#openrouter-key-input");
+  const result = document.querySelector("#openrouter-key-result");
+  const key = input.value;
+  input.value = "";
+  if (!key.trim()) {
+    result.textContent = "Enter an OpenRouter inference API key first.";
+    return;
+  }
+  try {
+    await api("/api/openrouter/key", {
+      method: "POST", body: JSON.stringify({ api_key: key }),
+    });
+    result.textContent = "Key stored securely with Windows DPAPI.";
+    await refreshOpenRouterKeyStatus();
+  } catch (error) {
+    result.textContent = `${error.code}: ${error.message}`;
+  }
+}
+
+async function checkOpenRouterKey() {
+  const result = document.querySelector("#openrouter-key-result");
+  try {
+    const response = await api("/api/openrouter/key-check");
+    const key = response.key;
+    result.textContent = [
+      "Authorization verified.",
+      key.limit === null ? "Limit: not reported." : `Limit: $${key.limit}.`,
+      key.limit_remaining === null ? "Remaining: not reported." : `Remaining: $${key.limit_remaining}.`,
+      key.limit_reset ? `Reset: ${key.limit_reset}.` : "",
+    ].filter(Boolean).join(" ");
+  } catch (error) {
+    result.textContent = `${error.code}: ${error.message}`;
+  }
+}
+
+async function discoverOpenRouterModels() {
+  const result = document.querySelector("#openrouter-key-result");
+  const output = document.querySelector("#model-discovery-output");
+  try {
+    const response = await api("/api/openrouter/models");
+    output.textContent = JSON.stringify(response, null, 2);
+    result.textContent = `Catalog read successfully (${response.catalog_count} entries). These are catalog candidates, not live-tested models.`;
+  } catch (error) {
+    output.textContent = "";
+    result.textContent = `${error.code}: ${error.message}`;
+  }
+}
+
+async function deleteOpenRouterKey() {
+  if (!window.confirm("Delete the SAVVA-stored OpenRouter key? An environment-managed key is not changed.")) return;
+  const result = document.querySelector("#openrouter-key-result");
+  try {
+    await api("/api/openrouter/key/delete", { method: "POST", body: "{}" });
+    result.textContent = "SAVVA-stored key deleted.";
+    await refreshOpenRouterKeyStatus();
+  } catch (error) {
+    result.textContent = `${error.code}: ${error.message}`;
+  }
+}
+
 elements.composer.addEventListener("submit", (event) => {
   event.preventDefault();
   sendMessage(elements.input.value);
@@ -634,10 +706,20 @@ document.querySelectorAll(".suggestion").forEach((button) => {
 });
 
 document.querySelector("#open-settings").addEventListener("click", async () => {
-  const settings = await api("/api/settings");
-  applySettings(settings);
-  elements.settingsDialog.showModal();
+  try {
+    const settings = await api("/api/settings");
+    applySettings(settings);
+    await refreshOpenRouterKeyStatus();
+    elements.settingsDialog.showModal();
+  } catch (error) {
+    appendSystemNotice(`SETTINGS_UNAVAILABLE: ${error.code}: ${error.message}`);
+  }
 });
+
+document.querySelector("#store-openrouter-key").addEventListener("click", storeOpenRouterKey);
+document.querySelector("#check-openrouter-key").addEventListener("click", checkOpenRouterKey);
+document.querySelector("#discover-openrouter-models").addEventListener("click", discoverOpenRouterModels);
+document.querySelector("#delete-openrouter-key").addEventListener("click", deleteOpenRouterKey);
 
 document.querySelector("#new-chat").addEventListener("click", async () => {
   await api("/api/reset", {
