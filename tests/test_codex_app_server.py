@@ -5,7 +5,7 @@ import queue
 import threading
 import unittest
 
-from savva.agent.codex_app_server import CodexAppServerAdapter, _rpc_error
+from savva.agent.codex_app_server import CodexAppServerAdapter, _merge_rate_limit_update, _rpc_error
 from savva.agent.models import ModelAdapterError
 
 
@@ -69,6 +69,22 @@ class FakeProcess:
 
 
 class CodexDispatchTests(unittest.TestCase):
+    def test_partial_quota_notification_preserves_full_read_snapshot(self):
+        original = {"ordinaryUsageAllowed": True,
+                    "rateLimits": {"limitId": "codex", "primary": {"usedPercent": 20, "resetsAt": 500},
+                                   "secondary": {"usedPercent": 40, "resetsAt": 900},
+                                   "rateLimitReachedType": None},
+                    "rateLimitsByLimitId": {"codex": {"limitId": "codex", "primary": {"usedPercent": 20},
+                                                         "secondary": {"usedPercent": 40}}}}
+        merged = _merge_rate_limit_update(original, {"limitId": "codex", "primary": {"usedPercent": 30},
+                                                     "secondary": None, "rateLimitReachedType": None})
+        self.assertTrue(merged["ordinaryUsageAllowed"])
+        self.assertEqual(merged["rateLimits"]["primary"]["usedPercent"], 30)
+        self.assertEqual(merged["rateLimits"]["primary"]["resetsAt"], 500)
+        self.assertEqual(merged["rateLimits"]["secondary"]["usedPercent"], 40)
+        self.assertEqual(merged["rateLimits"]["secondary"]["resetsAt"], 900)
+        self.assertEqual(merged["rateLimitsByLimitId"]["codex"]["secondary"]["usedPercent"], 40)
+
     def test_turn_completed_after_turn_start_rpc_is_delivered(self):
         adapter = CodexAppServerAdapter(workspace_root=".")
         adapter._process = FakeProcess()

@@ -93,6 +93,40 @@ class FailoverTests(unittest.TestCase):
         self.assertTrue(snapshot.exhausted)
         self.assertEqual(len(snapshot.windows), 4)
 
+    def test_ordinary_usage_admission_is_authoritative(self):
+        allowed = QuotaSnapshot.parse({**limits(), "ordinaryUsageAllowed": True})
+        denied = QuotaSnapshot.parse({**limits(), "ordinaryUsageAllowed": False})
+        unavailable = QuotaSnapshot.parse({**limits(), "ordinaryUsageAllowed": None})
+        self.assertEqual((allowed.availability, allowed.confidence),
+                         (QuotaAvailability.AVAILABLE, "server_confirmed"))
+        self.assertEqual(denied.availability, QuotaAvailability.UNKNOWN)
+        self.assertEqual(unavailable.availability, QuotaAvailability.UNKNOWN)
+
+    def test_legacy_complete_schema_has_limited_confidence(self):
+        snapshot = QuotaSnapshot.parse(limits())
+        self.assertEqual(snapshot.availability, QuotaAvailability.AVAILABLE)
+        self.assertEqual(snapshot.confidence, "legacy_limited")
+        self.assertEqual(QuotaSnapshot.parse({"rateLimits": {"primary": None}}).availability,
+                         QuotaAvailability.UNKNOWN)
+
+    def test_server_permission_recovers_fallback(self):
+        samples = iter([limits(100, 100, reset=1), {**limits(), "ordinaryUsageAllowed": True}])
+        primary = FakeAdapter("codex_chatgpt", "gpt", limits=lambda: next(samples))
+        fallback = FakeAdapter("openrouter", "backup")
+        engine = FailoverEngine(primary, fallback)
+        engine.complete([], [], max_tokens=32, timeout_seconds=1)
+        engine.next_quota_check = 0
+        engine.complete([], [], max_tokens=32, timeout_seconds=1)
+        self.assertEqual(engine.state, FailoverState.PRIMARY_RECOVERED)
+        self.assertEqual((primary.calls, fallback.calls), (1, 1))
+
+    def test_unconfirmed_denial_does_not_send_paid_fallback(self):
+        primary = FakeAdapter("codex_chatgpt", "gpt", limits={**limits(), "ordinaryUsageAllowed": False})
+        fallback = FakeAdapter("openrouter", "backup")
+        result = FailoverEngine(primary, fallback).complete([], [], max_tokens=32, timeout_seconds=1)
+        self.assertEqual(result.content, "ok")
+        self.assertEqual((primary.calls, fallback.calls), (1, 0))
+
     def test_incomplete_quota_status_is_unknown_and_does_not_recover_fallback(self):
         samples = iter([limits(100, 100), {"rateLimits": {"primary": None}}])
         primary = FakeAdapter("codex_chatgpt", "gpt", limits=lambda: next(samples))

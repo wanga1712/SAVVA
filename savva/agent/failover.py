@@ -33,6 +33,7 @@ class QuotaSnapshot:
     next_check_at: float | None
     reached_type: str | None
     windows: tuple[dict[str, Any], ...]
+    confidence: str = "unknown"
 
     @property
     def exhausted(self) -> bool:
@@ -41,7 +42,9 @@ class QuotaSnapshot:
     @classmethod
     def parse(cls, document: dict[str, Any] | None) -> "QuotaSnapshot":
         if not isinstance(document, dict):
-            return cls(QuotaAvailability.UNKNOWN, None, None, ())
+            return cls(QuotaAvailability.UNKNOWN, None, None, (), "unknown")
+        ordinary_present = "ordinaryUsageAllowed" in document or "ordinary_usage_allowed" in document
+        ordinary_allowed = document.get("ordinaryUsageAllowed", document.get("ordinary_usage_allowed"))
         root = document.get("rateLimits") if isinstance(document.get("rateLimits"), dict) else document
         buckets = document.get("rateLimitsByLimitId") or root.get("rateLimitsByLimitId")
         candidates = list(buckets.values()) if isinstance(buckets, dict) else [root]
@@ -103,10 +106,19 @@ class QuotaSnapshot:
                     continue
             if not bucket_has_window and not reached and bucket.get("spendControlReached") is not True:
                 incomplete = True
-        availability = (QuotaAvailability.EXHAUSTED if exhausted else
-                        QuotaAvailability.UNKNOWN if incomplete else QuotaAvailability.AVAILABLE)
+        if ordinary_allowed is True:
+            availability, confidence = QuotaAvailability.AVAILABLE, "server_confirmed"
+        elif exhausted:
+            availability, confidence = QuotaAvailability.EXHAUSTED, "quota_confirmed"
+        elif ordinary_present:
+            # False without a confirmed quota reason and explicit null are not recovery.
+            availability, confidence = QuotaAvailability.UNKNOWN, "server_unavailable"
+        elif incomplete:
+            availability, confidence = QuotaAvailability.UNKNOWN, "unknown"
+        else:
+            availability, confidence = QuotaAvailability.AVAILABLE, "legacy_limited"
         # All exhausted buckets must reset before probing the primary again.
-        return cls(availability, max(resets) if resets else None, reached, tuple(windows))
+        return cls(availability, max(resets) if resets else None, reached, tuple(windows), confidence)
 
 
 class FailoverEngine(ModelAdapter):

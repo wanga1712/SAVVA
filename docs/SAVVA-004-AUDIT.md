@@ -116,3 +116,17 @@ Protocol references checked: [Codex App Server rate-limit protocol](https://gith
 ### Remaining acceptance gap
 
 The real OpenRouter failover call and reconciliation with an actual provider charge remain unverified because the key is absent. Budget checks are conservative preflight plus reservation/reconciliation, not a mathematically guaranteed provider billing cap. The real GPT call used 13,280 total tokens, so the live check was successful but larger in token usage than the short visible prompt suggests.
+
+## SAVVA-004-FAILOVER-003 — quota admission repair (2026-11-19)
+
+Branch: `wip/SAVVA-004-FAILOVER-003`, based on WIP-002 commit `836b787fd326a2e78b70d3c1ec3e5ba8a8a833d8`.
+
+- `savva/agent/failover.py`: `QuotaSnapshot` reads the server's `ordinaryUsageAllowed`. `true` is server-confirmed availability; `false` and explicit `null` do not recover GPT. `false` only permits fallback when an independent, recognized quota signal confirms exhaustion. Older responses without the field can report `legacy_limited` availability only when quota windows are complete.
+- `savva/agent/codex_app_server.py`: sparse `account/rateLimits/updated` notifications merge into the full snapshot; omitted/null notification fields do not erase previously known admission, windows, or resets.
+- `tests/test_failover.py`, `tests/test_codex_app_server.py`: coverage for true/false/null, old schema, recovery, no false paid fallback, and sparse notification retention.
+- Full regression command `python -m unittest discover -s tests -v`: PASS, 75 tests. `git diff --check`: PASS.
+- Mock acceptance: recovery uses confirmed permission; incomplete/denied status does not cause false paid calls; notification merge preserves the existing full response. No API model was called; API cost for this WIP's tests is `$0.00`.
+- Real authorization: `codex login status` confirms ChatGPT sign-in. A successful real App Server generation and `account/rateLimits/read` are recorded in the preceding WIP-002 section; this WIP made no additional generation because it changes only quota interpretation and notification merging. No quota was intentionally consumed.
+- Fallback key: `OPENROUTER_API_KEY` is not configured in the process environment. Real OpenRouter fallback: **NOT VERIFIED**; no paid call was sent.
+- Protocol reference: [Codex App Server account and rate-limit protocol](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/account.rs). The server permission field is the admission signal; nullable/omitted permission is not affirmative recovery.
+- GitHub publication, final commit SHA, and secret scan are pending at the time of this report edit. No merge or deployment was performed.

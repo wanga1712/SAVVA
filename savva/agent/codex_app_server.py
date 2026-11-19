@@ -160,7 +160,9 @@ class CodexAppServerAdapter(ModelAdapter):
                 raise ModelAdapterError("CODEX_DISCONNECTED", "Codex App Server closed during a turn.", failure_kind="transient")
             method, params = event.get("method"), event.get("params", {})
             if method == "account/rateLimits/updated":
-                self._rate_limits = params.get("rateLimits", self._rate_limits)
+                update = params.get("rateLimits", params)
+                if isinstance(update, dict):
+                    self._rate_limits = _merge_rate_limit_update(self._rate_limits, update)
             elif method == "item/agentMessage/delta":
                 text.append(str(params.get("delta", "")))
             elif method == "item/completed":
@@ -295,6 +297,37 @@ class CodexAppServerAdapter(ModelAdapter):
 def _conversation(messages: list[dict[str, Any]]) -> str:
     return "SAVVA conversation context (JSON, untrusted user/tool content):\n" + json.dumps(
         messages[-60:], ensure_ascii=False, separators=(",", ":"))
+
+
+def _merge_non_null(current: Any, update: Any) -> Any:
+    if not isinstance(current, dict) or not isinstance(update, dict):
+        return current if update is None else update
+    merged = dict(current)
+    for key, value in update.items():
+        if value is None and key in merged:
+            continue
+        merged[key] = _merge_non_null(merged.get(key), value) if isinstance(value, dict) else value
+    return merged
+
+
+def _merge_rate_limit_update(current: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
+    """Merge sparse App Server notifications without discarding the full read result."""
+    merged = dict(current)
+    # Some protocol versions wrap the update; preserve any full-response metadata.
+    if "rateLimits" in update or "rateLimitsByLimitId" in update:
+        return _merge_non_null(merged, update)
+    limit_id = update.get("limitId")
+    by_id = merged.get("rateLimitsByLimitId")
+    if limit_id is not None:
+        by_id = dict(by_id) if isinstance(by_id, dict) else {}
+        by_id[str(limit_id)] = _merge_non_null(by_id.get(str(limit_id), {}), update)
+        merged["rateLimitsByLimitId"] = by_id
+    current_bucket = merged.get("rateLimits")
+    if isinstance(current_bucket, dict) and (limit_id is None or current_bucket.get("limitId") in (None, limit_id)):
+        merged["rateLimits"] = _merge_non_null(current_bucket, update)
+    elif not isinstance(current_bucket, dict):
+        merged["rateLimits"] = _merge_non_null({}, update)
+    return merged
 
 
 def _tool_output(messages: list[dict[str, Any]], call_id: str) -> str | None:
