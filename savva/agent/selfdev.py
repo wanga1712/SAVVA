@@ -241,5 +241,3 @@ def _git(root: Path, *arguments: str) -> str:
     result = subprocess.run(["git", *arguments], cwd=root, shell=False, stdin=subprocess.DEVNULL,
                             capture_output=True, text=True, timeout=10, check=True)
     return result.stdout.strip()
-
-\n
