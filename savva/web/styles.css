@@ -490,6 +490,12 @@ button.tree-item:hover { background: rgba(111, 231, 179, 0.08); }
 }
 .settings-dialog::backdrop { background: rgba(0, 0, 0, 0.7); backdrop-filter: blur(5px); }
 .settings-dialog form { padding: 25px; }
+.history-dialog { width: min(620px, calc(100vw - 32px)); }
+.chat-history-list { display: grid; gap: 8px; max-height: min(60vh, 560px); overflow: auto; }
+.history-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; }
+.history-open { min-width: 0; overflow: hidden; color: var(--text); text-align: left; text-overflow: ellipsis; white-space: nowrap; background: none; border: 0; cursor: pointer; }
+.history-open:hover, .history-open[aria-current="true"] { color: var(--accent); }
+.history-date { flex: 0 0 auto; color: var(--muted); font-size: 0.78rem; }
 .dialog-content { padding: 25px; }
 .proposal-dialog { width: min(1040px, calc(100vw - 24px)); }
 .file-dialog { width: min(920px, calc(100vw - 24px)); }

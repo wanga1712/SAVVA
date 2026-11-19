@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -29,6 +31,7 @@ from .agent.usage import UsageLogger
 
 MAX_REQUEST_BODY = 65_536
 MAX_MESSAGE_LENGTH = 8_000
+LOGGER = logging.getLogger("savva.server")
 
 
 @dataclass(slots=True)
@@ -36,6 +39,8 @@ class SessionState:
     messages: list[dict[str, Any]]
     requests: int = 0
     cost_usd: float = 0.0
+    status: str = "empty"
+    operation_id: str | None = None
 
 
 class SessionStore:
@@ -51,12 +56,16 @@ class SessionStore:
                 self._sessions.move_to_end(session_id)
             if state is None:
                 return SessionState([])
-            return SessionState(list(state.messages), state.requests, state.cost_usd)
+            return SessionState(
+                list(state.messages), state.requests, state.cost_usd,
+                state.status, state.operation_id,
+            )
 
     def set(self, session_id: str, state: SessionState) -> None:
         with self._lock:
             self._sessions[session_id] = SessionState(
-                list(state.messages), state.requests, state.cost_usd
+                list(state.messages), state.requests, state.cost_usd,
+                state.status, state.operation_id,
             )
             self._sessions.move_to_end(session_id)
             while len(self._sessions) > self._max_sessions:
@@ -65,6 +74,13 @@ class SessionStore:
     def clear(self, session_id: str) -> None:
         with self._lock:
             self._sessions.pop(session_id, None)
+
+    def begin(self, session_id: str, previous: SessionState, message: str,
+              operation_id: str) -> None:
+        self.set(session_id, SessionState(
+            [*previous.messages, {"role": "user", "content": message}],
+            previous.requests, previous.cost_usd, "active", operation_id,
+        ))
 
 
 class AppRuntime:
@@ -91,6 +107,8 @@ class AppRuntime:
             action_log_path or default_usage_log_path().with_name("actions.jsonl")
         )
         self.sessions = SessionStore()
+        self._chat_locks: dict[str, threading.Lock] = {}
+        self._chat_locks_guard = threading.Lock()
         self.tailscale_inspector = tailscale_inspector or TailscaleInspector()
         self._project_services: dict[str, ProjectService] = {}
         self._project_services_lock = threading.Lock()
@@ -126,7 +144,15 @@ class AppRuntime:
     def tailscale_status(self) -> TailscaleExitStatus:
         return self.tailscale_inspector.inspect()
 
-    def chat(self, message: str, session_id: str) -> dict[str, Any]:
+    def chat(self, message: str, session_id: str,
+             operation_id: str | None = None) -> dict[str, Any]:
+        with self._chat_locks_guard:
+            lock = self._chat_locks.setdefault(session_id, threading.Lock())
+        with lock:
+            return self._chat_locked(message, session_id, operation_id)
+
+    def _chat_locked(self, message: str, session_id: str,
+                     operation_id: str | None = None) -> dict[str, Any]:
         settings = self.settings()
         egress = self.tailscale_status()
         self._validate_egress(settings, egress)
@@ -152,24 +178,36 @@ class AppRuntime:
             project_service=project_service,
         )
         previous = self.sessions.get(session_id)
-        result = orchestrator.run(
-            previous.messages,
-            message,
-            session_id=session_id,
-            initial_requests=previous.requests,
-            initial_cost_usd=previous.cost_usd,
-        )
+        operation_id = operation_id or uuid.uuid4().hex
+        self.sessions.begin(session_id, previous, message, operation_id)
+        try:
+            result = orchestrator.run(
+                previous.messages,
+                message,
+                session_id=session_id,
+                initial_requests=previous.requests,
+                initial_cost_usd=previous.cost_usd,
+            )
+        except Exception:
+            self.sessions.set(session_id, SessionState(
+                [*previous.messages, {"role": "user", "content": message}],
+                previous.requests, previous.cost_usd, "failed", operation_id,
+            ))
+            raise
         self.sessions.set(
             session_id,
             SessionState(
                 messages=result.messages,
                 requests=result.usage["requests"],
                 cost_usd=result.usage["cost_usd"],
+                status="complete",
+                operation_id=operation_id,
             ),
         )
         return {
             "status": "success",
             "session_id": session_id,
+            "operation_id": operation_id,
             "answer": result.answer,
             "events": result.events,
             "usage": result.usage,
@@ -243,6 +281,28 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            if path == "/api/session":
+                query = parse_qs(urlparse(self.path).query)
+                session_id = query.get("session_id", [""])[0]
+                if not 8 <= len(session_id) <= 100:
+                    self._error(HTTPStatus.BAD_REQUEST, "INVALID_SESSION",
+                                "A valid session_id is required.")
+                    return
+                state = self.server.runtime.sessions.get(session_id)
+                visible_messages = [
+                    {"role": item.get("role"), "content": item.get("content")}
+                    for item in state.messages
+                    if item.get("role") in {"user", "assistant"}
+                    and isinstance(item.get("content"), str)
+                    and item.get("content").strip()
+                ]
+                self._json(HTTPStatus.OK, {
+                    "status": "success", "session_id": session_id,
+                    "exists": state.status != "empty", "state": state.status,
+                    "operation_id": state.operation_id,
+                    "messages": visible_messages,
+                })
+                return
             if path == "/api/settings":
                 self._json(HTTPStatus.OK, self.server.runtime.public_settings())
                 return
@@ -309,6 +369,7 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
                 return
             self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Resource not found.")
         except Exception:
+            LOGGER.exception("Unhandled SAVVA GET request failure")
             self._error(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -349,7 +410,15 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
                         "A valid session_id is required.",
                     )
                     return
-                result = self.server.runtime.chat(message.strip(), session_id)
+                operation_id = body.get("operation_id")
+                if operation_id is not None and (
+                    not isinstance(operation_id, str) or not 8 <= len(operation_id) <= 100
+                    or any(not (char.isalnum() or char in "-_") for char in operation_id)
+                ):
+                    self._error(HTTPStatus.BAD_REQUEST, "INVALID_OPERATION_ID",
+                                "operation_id is invalid.")
+                    return
+                result = self.server.runtime.chat(message.strip(), session_id, operation_id)
                 self._json(HTTPStatus.OK, result)
                 return
             if path == "/api/reset":
@@ -412,6 +481,7 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
         except (AgentRuntimeError, ModelAdapterError) as exc:
             self._error(HTTPStatus.BAD_GATEWAY, exc.code, exc.safe_message)
         except Exception:
+            LOGGER.exception("Unhandled SAVVA POST request failure")
             self._error(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
@@ -456,12 +526,17 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
 
     def _json(self, status: HTTPStatus, document: dict[str, Any]) -> None:
         payload = json.dumps(document, ensure_ascii=False, allow_nan=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self._security_headers()
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self._security_headers()
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            # A browser can close an in-flight request after navigation or tab close.
+            # The operation has already been persisted; this is not an app failure.
+            return
 
     def _error(self, status: HTTPStatus, code: str, message: str) -> None:
         self._json(

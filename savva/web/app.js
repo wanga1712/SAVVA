@@ -1,6 +1,14 @@
+const CHAT_STORAGE_KEY = "savva.chat-history.v1";
+
 const state = {
-  sessionId: crypto.randomUUID(),
-  busy: false,
+  sessionId: "",
+  chats: [],
+  busySessions: new Set(),
+  monitoredSessions: new Set(),
+  lastNewChatAt: 0,
+  storageWarningShown: false,
+  corruptStorageWarning: false,
+  welcomeCard: null,
   settings: null,
   currentProposal: null,
 };
@@ -35,17 +43,331 @@ const elements = {
   proposalError: document.querySelector("#proposal-error"),
   approveProposal: document.querySelector("#approve-proposal"),
   rejectProposal: document.querySelector("#reject-proposal"),
+  historyDialog: document.querySelector("#history-dialog"),
+  historyList: document.querySelector("#chat-history-list"),
 };
 
+function createChatRecord() {
+  const now = Date.now();
+  return { id: crypto.randomUUID(), createdAt: now, updatedAt: now, messages: [] };
+}
+
+function activeChat() {
+  return state.chats.find((chat) => chat.id === state.sessionId) || null;
+}
+
+function showStorageWarning(code, message) {
+  if (state.storageWarningShown) return;
+  state.storageWarningShown = true;
+  appendSystemNotice(`${code}: ${message}`);
+}
+
+function persistChatState() {
+  if (state.storageDisabled) return;
+  try {
+    localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify({
+      version: 1,
+      currentSessionId: state.sessionId,
+      chats: state.chats,
+    }));
+  } catch {
+    state.storageDisabled = true;
+    showStorageWarning(
+      "CHAT_STORAGE_UNAVAILABLE",
+      "This chat remains open, but browser storage could not save it.",
+    );
+  }
+}
+
+function initializeChatHistory() {
+  state.welcomeCard = elements.messages.querySelector(".welcome-card")?.cloneNode(true) || null;
+  let saved;
+  try {
+    const raw = localStorage.getItem(CHAT_STORAGE_KEY);
+    if (raw) {
+      try {
+        saved = JSON.parse(raw);
+      } catch {
+        state.storageDisabled = true;
+        state.corruptStorageWarning = true;
+      }
+    }
+  } catch {
+    state.storageDisabled = true;
+  }
+
+  if (saved?.version === 1 && Array.isArray(saved.chats)) {
+    state.chats = saved.chats.filter((chat) =>
+      chat && typeof chat.id === "string" && Array.isArray(chat.messages),
+    ).map((chat) => ({
+      id: chat.id,
+      createdAt: Number(chat.createdAt) || Date.now(),
+      updatedAt: Number(chat.updatedAt) || Number(chat.createdAt) || Date.now(),
+      messages: chat.messages.filter((message) =>
+        message && ["user", "assistant", "status"].includes(message.role)
+        && typeof message.content === "string",
+      ).map((message) => ({
+        id: typeof message.id === "string" ? message.id : crypto.randomUUID(),
+        role: message.role,
+        content: message.content,
+        status: message.status === "pending" ? "interrupted" : message.status,
+        operationId: typeof message.operationId === "string" ? message.operationId : null,
+      })),
+    }));
+    const current = state.chats.find((chat) => chat.id === saved.currentSessionId);
+    state.sessionId = current?.id || state.chats.at(-1)?.id || "";
+  } else if (saved) {
+    state.storageDisabled = true;
+    state.corruptStorageWarning = true;
+  }
+  if (!state.sessionId) {
+    const chat = createChatRecord();
+    state.chats.push(chat);
+    state.sessionId = chat.id;
+  }
+  renderCurrentChat();
+  if (state.corruptStorageWarning) {
+    appendSystemNotice(
+      "CHAT_HISTORY_INVALID: Saved browser history was left untouched; a temporary new chat is available.",
+    );
+  } else if (state.storageDisabled) {
+    showStorageWarning(
+      "CHAT_STORAGE_UNAVAILABLE",
+      "Browser storage could not be read; the current chat is available for this page only.",
+    );
+  } else if (!state.storageDisabled) {
+    persistChatState();
+  }
+}
+
+function renderSavedMessage(message) {
+  if (message.role === "user") {
+    const article = document.createElement("article");
+    article.className = "message message-user";
+    article.textContent = message.content;
+    elements.messages.append(article);
+    return;
+  }
+  if (message.role === "status") {
+    const notice = document.createElement("div");
+    notice.className = "usage-row";
+    notice.textContent = message.content;
+    elements.messages.append(notice);
+    return;
+  }
+  const article = document.createElement("article");
+  article.className = "message message-agent";
+  const orb = document.createElement("span");
+  orb.className = "agent-orb";
+  orb.textContent = "S";
+  const body = document.createElement("div");
+  body.className = "agent-body";
+  if (message.status === "pending" || message.status === "interrupted") {
+    const pending = document.createElement("p");
+    pending.className = "muted-note";
+    pending.textContent = message.status === "interrupted"
+      ? "Operation status was preserved as unknown after the page closed. It was not retried automatically."
+      : message.content;
+    body.append(pending);
+  } else {
+    const answer = document.createElement("div");
+    answer.className = "answer";
+    renderFormattedAnswer(answer, message.content);
+    body.append(answer);
+  }
+  article.append(orb, body);
+  elements.messages.append(article);
+}
+
+function renderCurrentChat() {
+  elements.messages.replaceChildren();
+  const chat = activeChat();
+  if (!chat || chat.messages.length === 0) {
+    if (state.welcomeCard) elements.messages.append(state.welcomeCard.cloneNode(true));
+  } else {
+    chat.messages.forEach(renderSavedMessage);
+  }
+  scrollToBottom();
+}
+
+function saveChatMessage(sessionId, message) {
+  const chat = state.chats.find((item) => item.id === sessionId);
+  if (!chat) return;
+  chat.messages.push(message);
+  chat.updatedAt = Date.now();
+  persistChatState();
+}
+
+function chatTitle(chat) {
+  const first = chat.messages.find((message) => message.role === "user");
+  return first?.content?.trim().slice(0, 72) || "New conversation";
+}
+
+function renderChatHistory() {
+  elements.historyList.replaceChildren();
+  [...state.chats].sort((left, right) => right.updatedAt - left.updatedAt)
+    .forEach((chat) => {
+      const row = document.createElement("div");
+      row.className = "history-row";
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "history-open";
+      open.textContent = chatTitle(chat);
+      open.setAttribute("aria-current", chat.id === state.sessionId ? "true" : "false");
+      open.addEventListener("click", () => {
+        state.sessionId = chat.id;
+        persistChatState();
+        elements.historyDialog.close();
+        renderCurrentChat();
+        updateComposerState();
+        elements.input.focus();
+        void restoreSession(chat.id);
+      });
+      const date = document.createElement("span");
+      date.className = "history-date";
+      date.textContent = new Date(chat.updatedAt).toLocaleString();
+      row.append(open, date);
+      elements.historyList.append(row);
+    });
+  if (!state.chats.length) {
+    const empty = document.createElement("p");
+    empty.className = "muted-note";
+    empty.textContent = "No saved conversations.";
+    elements.historyList.append(empty);
+  }
+}
+
+function updateComposerState() {
+  const busy = state.busySessions.has(state.sessionId);
+  elements.send.disabled = busy;
+  elements.input.setAttribute("aria-busy", String(busy));
+}
+
+function replaceChatFromSnapshot(chat, snapshot) {
+  const pendingMatches = chat.messages.some((message) =>
+    ["pending", "interrupted"].includes(message.status)
+    && message.operationId === snapshot.operation_id,
+  );
+  const hasLocalTranscript = chat.messages.some((message) =>
+    ["user", "assistant"].includes(message.role),
+  );
+  if (hasLocalTranscript && !pendingMatches) return;
+  const restored = snapshot.messages.map((message, index) => ({
+    id: `restored-${index}`,
+    role: message.role,
+    content: message.content,
+    status: "complete",
+    operationId: null,
+  }));
+  chat.messages = restored;
+  if (snapshot.state === "failed") {
+    chat.messages.push({
+      id: crypto.randomUUID(), role: "status",
+      content: "The last operation failed before completion. Its input was preserved; it was not retried.",
+      status: "complete", operationId: snapshot.operation_id || null,
+    });
+  }
+  chat.updatedAt = Date.now();
+  persistChatState();
+  if (state.sessionId === chat.id) renderCurrentChat();
+}
+
+async function restoreSession(sessionId) {
+  try {
+    const snapshot = await api(`/api/session?session_id=${encodeURIComponent(sessionId)}`, {
+      timeoutMs: 5000,
+    });
+    if (!snapshot.exists) return;
+    const chat = state.chats.find((item) => item.id === sessionId);
+    if (!chat) return;
+    if (snapshot.state === "active") {
+      if (!chat.messages.some((message) => message.status === "pending" || message.status === "interrupted")) {
+        chat.messages.push({
+          id: crypto.randomUUID(), role: "assistant", status: "pending",
+          operationId: snapshot.operation_id || null,
+          content: "SAVVA is still processing this conversation. It will not be submitted again.",
+        });
+        persistChatState();
+        if (state.sessionId === sessionId) renderCurrentChat();
+      }
+      monitorSession(sessionId);
+      return;
+    }
+    replaceChatFromSnapshot(chat, snapshot);
+  } catch (error) {
+    if (state.sessionId === sessionId) {
+      appendSystemNotice(`SESSION_STATUS_UNAVAILABLE: ${error.message}`);
+    }
+  }
+}
+
+function monitorSession(sessionId) {
+  if (state.monitoredSessions.has(sessionId)) return;
+  state.monitoredSessions.add(sessionId);
+  const poll = async (remaining) => {
+    if (remaining <= 0) {
+      state.monitoredSessions.delete(sessionId);
+      if (state.sessionId === sessionId) {
+        appendSystemNotice("OPERATION_STATUS_PENDING: The operation is still recorded; it was not resubmitted.");
+      }
+      return;
+    }
+    try {
+      const snapshot = await api(`/api/session?session_id=${encodeURIComponent(sessionId)}`, {
+        timeoutMs: 5000,
+      });
+      if (snapshot.state !== "active") {
+        const chat = state.chats.find((item) => item.id === sessionId);
+        if (chat && snapshot.exists) replaceChatFromSnapshot(chat, snapshot);
+        state.monitoredSessions.delete(sessionId);
+        return;
+      }
+    } catch (error) {
+      if (remaining <= 1 && state.sessionId === sessionId) {
+        appendSystemNotice(`SESSION_STATUS_UNAVAILABLE: ${error.message}`);
+      }
+    }
+    window.setTimeout(() => { void poll(remaining - 1); }, 1500);
+  };
+  window.setTimeout(() => { void poll(80); }, 1500);
+}
+
+async function restoreCurrentSession() {
+  await restoreSession(state.sessionId);
+}
+
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    headers: {
-      "Content-Type": "application/json",
-      "X-SAVVA-Request": "1",
-    },
-    ...options,
-  });
-  const document = await response.json().catch(() => ({}));
+  const { timeoutMs = 180000, ...requestOptions } = options;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetch(path, {
+      ...requestOptions,
+      headers: {
+        "Content-Type": "application/json",
+        "X-SAVVA-Request": "1",
+        ...(requestOptions.headers || {}),
+      },
+      signal: requestOptions.signal || controller.signal,
+    });
+  } catch (cause) {
+    const error = new Error(cause.name === "AbortError"
+      ? "The request timed out. Its operation status is preserved in this chat."
+      : "The SAVVA server could not be reached.");
+    error.code = cause.name === "AbortError" ? "REQUEST_TIMEOUT" : "SERVER_UNAVAILABLE";
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+  let document;
+  try {
+    document = await response.json();
+  } catch {
+    const error = new Error("The SAVVA server returned an unreadable response.");
+    error.code = "INVALID_RESPONSE";
+    throw error;
+  }
   if (!response.ok) {
     const error = new Error(document.error?.message || `HTTP ${response.status}`);
     error.code = document.error?.code || "HTTP_ERROR";
@@ -56,20 +378,25 @@ async function api(path, options = {}) {
 
 async function initialize() {
   try {
-    const [health, tools, settings, network] = await Promise.all([
-      api("/api/health"),
-      api("/api/tools"),
-      api("/api/settings"),
-      api("/api/network"),
-    ]);
-    renderHealth(health);
-    renderNetwork(network.tailscale);
-    renderTools(tools.tools);
-    applySettings(settings);
+    renderHealth(await api("/api/health"));
   } catch (error) {
     elements.connection.textContent = "Offline";
     elements.connection.className = "pill error";
+    appendSystemNotice(`${error.code}: ${error.message}`);
   }
+  const auxiliary = [
+    ["Tools", async () => renderTools((await api("/api/tools")).tools)],
+    ["Settings", async () => applySettings(await api("/api/settings"))],
+    ["Network status", async () => renderNetwork((await api("/api/network")).tailscale)],
+  ];
+  const results = await Promise.allSettled(auxiliary.map(([, load]) => load()));
+  results.forEach((result, index) => {
+    if (result.status === "rejected") {
+      const error = result.reason;
+      appendSystemNotice(`${auxiliary[index][0]} unavailable (${error.code || "REQUEST_FAILED"}).`);
+    }
+  });
+  await restoreCurrentSession();
 }
 
 function renderNetwork(tailscale) {
@@ -543,28 +870,62 @@ function scrollToBottom() {
 }
 
 async function sendMessage(text) {
-  if (state.busy || !text.trim()) return;
-  state.busy = true;
-  elements.send.disabled = true;
+  const sessionId = state.sessionId;
+  if (state.busySessions.has(sessionId) || !text.trim()) return;
+  const operationId = crypto.randomUUID();
+  const pendingMessage = {
+    id: operationId,
+    role: "assistant",
+    content: "SAVVA is working on this request…",
+    status: "pending",
+    operationId,
+  };
+  state.busySessions.add(sessionId);
+  updateComposerState();
   elements.input.value = "";
   addUserMessage(text);
+  saveChatMessage(sessionId, {
+    id: crypto.randomUUID(), role: "user", content: text, status: "complete",
+    operationId,
+  });
+  saveChatMessage(sessionId, pendingMessage);
   const shell = addAgentShell();
   try {
     const result = await api("/api/chat", {
       method: "POST",
-      body: JSON.stringify({ message: text, session_id: state.sessionId }),
+      body: JSON.stringify({
+        message: text, session_id: sessionId, operation_id: operationId,
+      }),
     });
-    renderAgentResult(shell, result);
+    pendingMessage.content = result.answer || "The model returned an empty answer.";
+    pendingMessage.status = "complete";
+    const chat = state.chats.find((item) => item.id === sessionId);
+    if (chat) chat.updatedAt = Date.now();
+    persistChatState();
+    if (state.sessionId === sessionId) renderAgentResult(shell, result);
   } catch (error) {
-    shell.thinking.remove();
-    const answer = document.createElement("div");
-    answer.className = "answer";
-    answer.textContent = `${error.code}: ${error.message}`;
-    shell.body.append(answer);
+    if (error.code === "REQUEST_TIMEOUT") {
+      pendingMessage.content = "Request timed out; operation status is unknown and will not be retried automatically.";
+      pendingMessage.status = "interrupted";
+      monitorSession(sessionId);
+    } else {
+      pendingMessage.content = `${error.code || "REQUEST_FAILED"}: ${error.message}`;
+      pendingMessage.status = "failed";
+    }
+    persistChatState();
+    if (state.sessionId === sessionId) {
+      shell.thinking.remove();
+      const answer = document.createElement("div");
+      answer.className = "answer";
+      answer.textContent = pendingMessage.content;
+      shell.body.append(answer);
+    }
   } finally {
-    state.busy = false;
-    elements.send.disabled = false;
-    elements.input.focus();
+    state.busySessions.delete(sessionId);
+    if (state.sessionId === sessionId) {
+      updateComposerState();
+      elements.input.focus();
+    }
   }
 }
 
@@ -629,24 +990,40 @@ elements.input.addEventListener("keydown", (event) => {
   }
 });
 
-document.querySelectorAll(".suggestion").forEach((button) => {
-  button.addEventListener("click", () => sendMessage(button.dataset.prompt || ""));
+elements.messages.addEventListener("click", (event) => {
+  const button = event.target.closest(".suggestion");
+  if (button) void sendMessage(button.dataset.prompt || "");
 });
 
 document.querySelector("#open-settings").addEventListener("click", async () => {
-  const settings = await api("/api/settings");
-  applySettings(settings);
-  elements.settingsDialog.showModal();
+  try {
+    applySettings(await api("/api/settings"));
+    elements.settingsDialog.showModal();
+  } catch (error) {
+    appendSystemNotice(`SETTINGS_UNAVAILABLE: ${error.message}`);
+  }
 });
 
-document.querySelector("#new-chat").addEventListener("click", async () => {
-  await api("/api/reset", {
-    method: "POST",
-    body: JSON.stringify({ session_id: state.sessionId }),
-  }).catch(() => {});
-  state.sessionId = crypto.randomUUID();
-  elements.messages.replaceChildren();
-  location.reload();
+document.querySelector("#new-chat").addEventListener("click", () => {
+  const now = Date.now();
+  if (now - state.lastNewChatAt < 250) return;
+  state.lastNewChatAt = now;
+  if (activeChat()?.messages.length === 0) {
+    elements.input.focus();
+    return;
+  }
+  const chat = createChatRecord();
+  state.chats.push(chat);
+  state.sessionId = chat.id;
+  persistChatState();
+  renderCurrentChat();
+  updateComposerState();
+  elements.input.focus();
+});
+
+document.querySelector("#chat-history").addEventListener("click", () => {
+  renderChatHistory();
+  elements.historyDialog.showModal();
 });
 
 elements.tabTools.addEventListener("click", () => showInspector("tools"));
@@ -695,4 +1072,5 @@ elements.settingsForm.elements.provider.addEventListener("change", (event) => {
   }
 });
 
+initializeChatHistory();
 initialize();

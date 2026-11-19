@@ -32,6 +32,20 @@ template. Never invent commercial prices or technical specifications; mark them 
 requiring confirmation. Do not expose secrets, credentials, personal paths, or
 private data."""
 
+SYSTEM_PROMPT += """
+
+Remote-access authority policy:
+For SSH, remote servers, databases, service identities, or production access,
+follow this order: current target-project operating rules; its currently approved
+canonical access matrix; approved connection profiles; the active WIP's explicitly
+approved scope; historical handoffs only as non-authoritative context. A WIP does
+not grant credentials or access by itself. Never infer, reconstruct, or copy a host,
+username, SSH alias, key path, database role, or credential from chat history,
+README deployment notes, logs, or old handoffs. If current rules or the canonical
+matrix are missing or conflict, do not attempt access and report
+IDENTITY_AUTHORITY_MISSING with the missing authority source. Do not choose a
+connection or identity by guessing."""
+
 
 class AgentRuntimeError(RuntimeError):
     def __init__(self, code: str, message: str):

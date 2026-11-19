@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from savva.agent.network import TailscaleExitStatus
 from savva.agent.orchestrator import AgentRuntimeError
-from savva.server import AppRuntime, SavvaHTTPServer, SavvaRequestHandler
+from savva.server import AppRuntime, SavvaHTTPServer, SavvaRequestHandler, SessionState
 
 
 class FakeTailscaleInspector:
@@ -113,6 +113,50 @@ class ServerTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 403)
         self.assertEqual(error["error"]["code"], "ORIGIN_DENIED")
+
+    def test_session_endpoint_preserves_completed_and_active_state(self) -> None:
+        session_id = "chat-session-state-1"
+        operation_id = "operation-state-1"
+        self.server.runtime.sessions.begin(
+            session_id, SessionState([]), "first question", operation_id
+        )
+        with urllib.request.urlopen(
+            self.base_url + f"/api/session?session_id={session_id}", timeout=5
+        ) as response:
+            active = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(active["state"], "active")
+        self.assertEqual(active["operation_id"], operation_id)
+        self.assertEqual(active["messages"], [{"role": "user", "content": "first question"}])
+
+        self.server.runtime.sessions.set(session_id, SessionState(
+            [{"role": "user", "content": "first question"},
+             {"role": "assistant", "content": "completed answer"}],
+            1, 0.0, "complete", operation_id,
+        ))
+        with urllib.request.urlopen(
+            self.base_url + f"/api/session?session_id={session_id}", timeout=5
+        ) as response:
+            completed = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(completed["state"], "complete")
+        self.assertEqual(completed["messages"][-1]["content"], "completed answer")
+
+    def test_explicit_reset_remains_available_for_a_session(self) -> None:
+        session_id = "chat-session-reset-1"
+        self.server.runtime.sessions.set(session_id, SessionState(
+            [{"role": "user", "content": "keep until explicit reset"}], 1, 0.0,
+            "complete", "operation-reset-1",
+        ))
+        request = urllib.request.Request(
+            self.base_url + "/api/reset",
+            data=json.dumps({"session_id": session_id}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-SAVVA-Request": "1",
+                     "Origin": self.base_url},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+        state = self.server.runtime.sessions.get(session_id)
+        self.assertEqual(state.status, "empty")
 
     def test_cross_origin_write_request_is_rejected(self) -> None:
         request = urllib.request.Request(
