@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ..core.permissions import Permission, PermissionPolicy
 from ..core.registry import ToolRegistry
 from ..core.schemas import ToolContract
 from ..tools.development import DevelopmentInspector
@@ -16,8 +17,11 @@ from .projects import ProjectService
 def build_agent_registry(
     workspace_root: str | Path,
     project_service: ProjectService | None = None,
+    selfdev_service=None,
 ) -> ToolRegistry:
-    registry = ToolRegistry()
+    granted = ({Permission.SYSTEM_READ, Permission.WORKSPACE_READ, Permission.SELFDEV_VALIDATE}
+               if selfdev_service is not None else None)
+    registry = ToolRegistry(policy=PermissionPolicy(granted) if granted else None)
     workspace = SafeWorkspace(workspace_root)
     projects = project_service or ProjectService(workspace_root)
     system = SystemInspector()
@@ -290,4 +294,6 @@ def build_agent_registry(
             project_path=args.get("project_path"),
         ),
     )
+    if selfdev_service is not None:
+        selfdev_service.register_tools(registry)
     return registry

@@ -63,6 +63,7 @@ class AgentOrchestrator:
         max_duration_seconds: float,
         usage_logger: UsageLogger,
         project_service: ProjectService | None = None,
+        selfdev_mode: bool = False,
     ):
         self.adapter = adapter
         self.registry = registry
@@ -75,6 +76,7 @@ class AgentOrchestrator:
         self.max_duration_seconds = max_duration_seconds
         self.usage_logger = usage_logger
         self.project_service = project_service
+        self.selfdev_mode = selfdev_mode
         self._tool_aliases, self._alias_to_tool = self._build_aliases()
 
     def run(
@@ -89,6 +91,17 @@ class AgentOrchestrator:
         working = list(messages)
         if not working or working[0].get("role") != "system":
             working.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+        if self.selfdev_mode:
+            working[0]["content"] += (
+                "\n\nCandidate self-development mode is enabled. For a source-code task, call "
+                "selfdev.begin, selfdev.discover, then persist the concise WIP with "
+                "selfdev.save_wip before preparing a patch. Use files.propose and files.diff; "
+                "record the proposal with selfdev.record_patch. Never call files.apply as an "
+                "automatic write: the user must approve the exact diff in the UI. Run "
+                "selfdev.validate only after the action journal confirms that exact proposal "
+                "was approved and applied. It runs only fixed Candidate checks; never create "
+                "or pass arbitrary commands. Stable is inaccessible and must remain unchanged."
+            )
         working.append({"role": "user", "content": user_message})
 
         tools = self._model_tools()

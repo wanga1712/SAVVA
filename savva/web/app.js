@@ -442,7 +442,7 @@ async function decideProposal(decision) {
   elements.rejectProposal.disabled = true;
   elements.proposalError.textContent = "";
   try {
-    await api("/api/confirm", {
+    const confirmation = await api("/api/confirm", {
       method: "POST",
       body: JSON.stringify({
         proposal_id: state.currentProposal.proposal_id,
@@ -458,6 +458,14 @@ async function decideProposal(decision) {
         ? "Files written after exact proposal approval."
         : "Proposal rejected. No files were changed.",
     );
+    if (confirmation.validation) {
+      appendSystemNotice(`Candidate validation: ${confirmation.validation.summary}`);
+      for (const check of confirmation.validation.checks || []) {
+        appendSystemNotice(
+          `${check.command_id}: exit_code=${check.exit_code}; timed_out=${check.timed_out}\n${check.stdout || check.stderr || "(no output)"}`,
+        );
+      }
+    }
     await Promise.all([loadProjectTree(), loadActions()]);
   } catch (error) {
     elements.proposalError.textContent = `${error.code}: ${error.message}`;

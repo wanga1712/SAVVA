@@ -17,12 +17,13 @@ class Permission(StrEnum):
     FILES_WRITE = "files.write"
     PACKAGES_INSTALL = "packages.install"
     PROCESS_EXECUTE = "process.execute"
+    SELFDEV_VALIDATE = "selfdev.validate"
 
 
 READ_PERMISSIONS = frozenset(
     {Permission.SYSTEM_READ, Permission.WORKSPACE_READ}
 )
-IMPLEMENTED_PERMISSIONS = frozenset({*READ_PERMISSIONS, Permission.FILES_WRITE})
+IMPLEMENTED_PERMISSIONS = frozenset({*READ_PERMISSIONS, Permission.FILES_WRITE, Permission.SELFDEV_VALIDATE})
 FUTURE_PERMISSIONS = frozenset(
     {
         Permission.PACKAGES_INSTALL,

@@ -23,6 +23,9 @@ from .agent.config import (
     default_usage_log_path,
     settings_from_environment,
 )
+from .agent.selfdev import SelfDevManifest, SelfDevelopmentService
+from .agent.selfdev_executor import ControlledWindowsExecutor
+from .agent.workflow import WorkflowStore
 from .agent.models import ModelAdapterError, OllamaAdapter, OpenRouterAdapter
 from .agent.codex_app_server import CodexAppServerAdapter
 from .agent.failover import FailoverEngine, FailoverState
@@ -129,8 +132,12 @@ class AppRuntime:
         usage_path: Path | None = None,
         action_log_path: Path | None = None,
         tailscale_inspector: TailscaleInspector | None = None,
+        selfdev_manifest: SelfDevManifest | None = None,
     ):
         self.project_root = project_root or Path(__file__).resolve().parent.parent
+        self.selfdev_manifest = selfdev_manifest
+        if selfdev_manifest and self.project_root.resolve() != selfdev_manifest.root:
+            raise SettingsError("SELFDEV_ROOT_MISMATCH", "Candidate runtime must use the manifest repository root.")
         try:
             settings = settings_from_environment(self.project_root)
         except SettingsError:
@@ -138,9 +145,18 @@ class AppRuntime:
                 workspace_root=str(self.project_root / "workspace")
             )
             settings.validate()
-        self.settings_store = SettingsStore(settings, settings_path)
+        candidate_state = self.project_root / ".savva"
+        if selfdev_manifest:
+            settings = AppSettings(**{**settings.to_public_dict(), "workspace_root": str(selfdev_manifest.root)})
+        self.settings_store = SettingsStore(
+            settings, settings_path or (candidate_state / "settings.json" if selfdev_manifest else None)
+        )
         self.settings_store.load()
-        self.usage_path = usage_path or default_usage_log_path()
+        if selfdev_manifest and Path(self.settings_store.get().workspace_root).resolve() != selfdev_manifest.root:
+            self.settings_store.update({"workspace_root": str(selfdev_manifest.root)})
+        self.usage_path = usage_path or (
+            candidate_state / "usage.jsonl" if selfdev_manifest else default_usage_log_path()
+        )
         self.usage_logger = UsageLogger(self.usage_path)
         self.action_journal = ActionJournal(
             action_log_path or self.usage_path.with_name("actions.jsonl")
@@ -152,6 +168,14 @@ class AppRuntime:
         self._chat_locks: dict[str, threading.Lock] = {}
         self._chat_locks_guard = threading.Lock()
         self._failover_budget_lock = threading.Lock()
+        self.selfdev_service: SelfDevelopmentService | None = None
+        if selfdev_manifest:
+            project_service = self.project_service(str(selfdev_manifest.root))
+            workflows = WorkflowStore(candidate_state / "selfdev" / "tasks.json")
+            self.selfdev_service = SelfDevelopmentService(
+                selfdev_manifest, ControlledWindowsExecutor(selfdev_manifest),
+                workflows, project_service, self.action_journal,
+            )
         self.codex_cli = shutil.which("codex")
         self.codex_chatgpt_authenticated = self._codex_chatgpt_login()
 
@@ -170,6 +194,14 @@ class AppRuntime:
     def settings(self) -> AppSettings:
         return self.settings_store.get()
 
+    def update_settings(self, changes: dict[str, Any]) -> AppSettings:
+        if self.selfdev_manifest:
+            requested = Path(str(changes.get("workspace_root", self.selfdev_manifest.root))).expanduser().resolve()
+            if requested != self.selfdev_manifest.root:
+                raise SettingsError("SELFDEV_WORKSPACE_DENIED", "Candidate workspace cannot be moved outside its manifest root.")
+            changes = {**changes, "workspace_root": str(self.selfdev_manifest.root)}
+        return self.settings_store.update(changes)
+
     def api_key(self) -> str | None:
         if self.settings().provider != "openrouter":
             return None
@@ -184,7 +216,7 @@ class AppRuntime:
 
     def tools(self) -> list[dict[str, Any]]:
         root = self.settings().workspace_root
-        return build_agent_registry(root, self.project_service(root)).list_tools()
+        return build_agent_registry(root, self.project_service(root), self.selfdev_service).list_tools()
 
     def project_service(self, workspace_root: str | None = None) -> ProjectService:
         root = str(Path(workspace_root or self.settings().workspace_root).resolve())
@@ -241,7 +273,7 @@ class AppRuntime:
         project_service = self.project_service(settings.workspace_root)
         orchestrator = AgentOrchestrator(
             adapter=adapter,
-            registry=build_agent_registry(settings.workspace_root, project_service),
+            registry=build_agent_registry(settings.workspace_root, project_service, self.selfdev_service),
             workspace_root=settings.workspace_root,
             max_tokens=settings.max_tokens,
             max_tool_steps=settings.max_tool_steps,
@@ -251,6 +283,7 @@ class AppRuntime:
             max_duration_seconds=settings.max_duration_seconds,
             usage_logger=self.usage_logger,
             project_service=project_service,
+            selfdev_mode=self.selfdev_service is not None,
         )
         try:
             result = orchestrator.run(
@@ -447,7 +480,7 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
         try:
             body = self._read_json()
             if path == "/api/settings":
-                settings = self.server.runtime.settings_store.update(body)
+                settings = self.server.runtime.update_settings(body)
                 public = settings.to_public_dict()
                 public["api_key_configured"] = self.server.runtime.api_key() is not None
                 self._json(HTTPStatus.OK, {"status": "success", "settings": public})
@@ -526,9 +559,12 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
                         "decision must be approve or reject.",
                     )
                     return
+                validation = None
+                if decision == "approve" and self.server.runtime.selfdev_service:
+                    validation = self.server.runtime.selfdev_service.after_approval(proposal_id)
                 self._json(
                     HTTPStatus.OK,
-                    {"status": "success", "proposal": proposal},
+                    {"status": "success", "proposal": proposal, "validation": validation},
                 )
                 return
             self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Endpoint not found.")
@@ -635,18 +671,22 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
         return
 
 
-def create_server(host: str, port: int) -> SavvaHTTPServer:
+def create_server(host: str, port: int, selfdev_manifest_path: Path | None = None) -> SavvaHTTPServer:
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError("SAVVA web interface may bind only to a loopback address.")
     server = SavvaHTTPServer((host, port), SavvaRequestHandler)
-    server.runtime = AppRuntime()
+    manifest = SelfDevManifest(selfdev_manifest_path) if selfdev_manifest_path else None
+    server.runtime = AppRuntime(project_root=manifest.root if manifest else None,
+                                selfdev_manifest=manifest)
     return server
 
 
-def serve(host: str = "127.0.0.1", port: int = 8765) -> int:
-    server = create_server(host, port)
+def serve(host: str = "127.0.0.1", port: int = 8765,
+          selfdev_manifest_path: Path | None = None) -> int:
+    server = create_server(host, port, selfdev_manifest_path)
     runtime = server.runtime
-    print(f"SAVVA interface: http://{host}:{port}")
+    label = "SAVVA Candidate" if runtime.selfdev_service else "SAVVA"
+    print(f"{label} interface: http://{host}:{port}")
     print(
         "OpenRouter key: "
         + ("configured" if runtime.api_key() else "not configured")

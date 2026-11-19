@@ -42,6 +42,28 @@ python -m unittest discover -s tests -v
 
 No package installation is required for these commands.
 
+## SAVVA Candidate self-development
+
+The `wip/SAVVA-SELFDEV-001` worktree is the only writable SAVVA project. Its
+manifest is `savva/selfdev/project-manifest.json`; Stable is listed as protected
+and is not a Candidate workspace. Start the isolated Candidate interface with:
+
+```powershell
+python -m savva.cli selfdev serve
+```
+
+It listens on `127.0.0.1:8766`, stores settings, sessions, approvals, and WIP
+under Candidate-local `.savva/`, and reuses the existing exact-diff approval UI.
+After approval, the Candidate runs its fixed syntax, static-quality, unittest,
+and diff checks and displays each real exit code and bounded output. A failed
+check is recorded as FAILED; there is no automatic repair. WIP can be restored
+with `python -m savva.cli selfdev status TASK_ID`.
+
+The executor accepts only named commands, always runs from the Candidate Git
+root without a shell, strips credentials from its child environment, enforces
+timeouts/output caps, and uses a cross-process lock. It offers no arbitrary
+PowerShell, installation, Git push, merge, or deployment operation.
+
 ## Agent flow
 
 1. The user sends a message to the local Python backend.

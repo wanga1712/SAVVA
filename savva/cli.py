@@ -7,7 +7,10 @@ import json
 import time
 from typing import Any, Sequence
 
+from .agent.selfdev import SelfDevManifest
+from .agent.selfdev_executor import COMMANDS, ControlledWindowsExecutor
 from .tools import build_default_registry
+from .agent.workflow import WorkflowStore
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,6 +41,16 @@ def build_parser() -> argparse.ArgumentParser:
     serve = commands.add_parser("serve", help="Start the local SAVVA web interface.")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
+
+    selfdev = commands.add_parser("selfdev", help="Run safe tools only in the SAVVA Candidate worktree.")
+    selfdev_commands = selfdev.add_subparsers(dest="selfdev_command", required=True)
+    selfdev_serve = selfdev_commands.add_parser("serve", help="Start the isolated Candidate chat and approval UI.")
+    selfdev_serve.add_argument("--host", default="127.0.0.1")
+    selfdev_serve.add_argument("--port", type=int, default=8766)
+    selfdev_check = selfdev_commands.add_parser("check", help="Run one fixed, manifest-approved Candidate check.")
+    selfdev_check.add_argument("check_id", choices=sorted(COMMANDS))
+    selfdev_status = selfdev_commands.add_parser("status", help="Read one persisted self-development WIP.")
+    selfdev_status.add_argument("task_id")
     return parser
 
 
@@ -48,6 +61,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         from .server import serve
 
         return serve(args.host, args.port)
+
+    if args.command == "selfdev":
+        try:
+            manifest = SelfDevManifest.load()
+            if args.selfdev_command == "serve":
+                from .server import serve
+                return serve(args.host, args.port, manifest.path)
+            if args.selfdev_command == "check":
+                result = ControlledWindowsExecutor(manifest).run(args.check_id)
+                print(json.dumps(result, indent=2, ensure_ascii=False))
+                return 0 if result["exit_code"] == 0 and not result["timed_out"] else 1
+            store = WorkflowStore(manifest.root / ".savva" / "selfdev" / "tasks.json")
+            task = store.get(args.task_id)
+            if task is None:
+                print(json.dumps({"status": "not_found"}))
+                return 2
+            print(json.dumps({"task_id": task.task_id, "state": task.state,
+                              "request": task.request, "history": task.history,
+                              "wip": task.metadata}, indent=2, ensure_ascii=False))
+            return 0
+        except (OSError, ValueError) as exc:
+            print(json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False))
+            return 1
 
     registry = build_default_registry()
 

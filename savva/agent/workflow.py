@@ -64,6 +64,7 @@ class WorkflowTask:
     max_attempts: int = 2
     attempts: int = 0
     history: list[dict[str, Any]] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -116,6 +117,13 @@ class WorkflowStore:
             doc = self._read().get(task_id)
             return WorkflowTask(**doc) if doc else None
 
+    def list_tasks(self, project_root: str | None = None) -> list[WorkflowTask]:
+        with self._lock:
+            tasks = [WorkflowTask(**item) for item in self._read().values() if isinstance(item, dict)]
+        if project_root is not None:
+            tasks = [task for task in tasks if task.project_root == project_root]
+        return sorted(tasks, key=lambda task: task.updated_at, reverse=True)
+
     def transition(self, task_id: str, state: WorkflowState, *, result: str | None = None) -> WorkflowTask:
         with self._lock:
             task = self.get(task_id)
@@ -133,6 +141,22 @@ class WorkflowStore:
             if result is not None:
                 event["result"] = result[:2000]
             task.history.append(event)
+            self._save(task)
+            return task
+
+    def update_metadata(self, task_id: str, changes: dict[str, Any]) -> WorkflowTask:
+        """Persist bounded workflow-specific WIP fields without changing its state graph."""
+        if not isinstance(changes, dict) or len(changes) > 32:
+            raise ValueError("Workflow metadata must be a small object.")
+        encoded = json.dumps(changes, ensure_ascii=False, allow_nan=False)
+        if len(encoded.encode("utf-8")) > 256_000:
+            raise ValueError("Workflow metadata exceeds its storage limit.")
+        with self._lock:
+            task = self.get(task_id)
+            if task is None:
+                raise KeyError(task_id)
+            task.metadata.update(json.loads(encoded))
+            task.updated_at = time.time()
             self._save(task)
             return task
 
