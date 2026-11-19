@@ -4,8 +4,10 @@ import json
 import queue
 import threading
 import unittest
+from unittest.mock import patch
 
 from savva.agent.codex_app_server import CodexAppServerAdapter, _merge_rate_limit_update, _rpc_error
+from savva.agent.failover import QuotaAvailability, QuotaSnapshot
 from savva.agent.models import ModelAdapterError
 
 
@@ -84,6 +86,33 @@ class CodexDispatchTests(unittest.TestCase):
         self.assertEqual(merged["rateLimits"]["secondary"]["usedPercent"], 40)
         self.assertEqual(merged["rateLimits"]["secondary"]["resetsAt"], 900)
         self.assertEqual(merged["rateLimitsByLimitId"]["codex"]["secondary"]["usedPercent"], 40)
+
+    def test_exhaustion_notification_invalidates_cached_permission_until_full_read(self):
+        adapter = CodexAppServerAdapter(workspace_root=".")
+        adapter._rate_limits = {
+            "ordinaryUsageAllowed": True,
+            "rateLimits": {"limitId": "codex", "primary": {"usedPercent": 20},
+                           "secondary": {"usedPercent": 40}},
+        }
+        adapter._events.put({"method": "account/rateLimits/updated", "params": {"rateLimits": {
+            "limitId": "codex", "primary": {"usedPercent": 100}}}})
+        adapter._events.put({"method": "turn/completed", "params": {"turn": {
+            "id": "turn-1", "status": "completed", "usage": {}}}})
+
+        adapter._wait_for_turn(timeout=1)
+        updated = QuotaSnapshot.parse(adapter._rate_limits)
+        self.assertIsNone(adapter._rate_limits["ordinaryUsageAllowed"])
+        self.assertEqual(updated.availability, QuotaAvailability.EXHAUSTED)
+
+        fresh_read = {"ordinaryUsageAllowed": True,
+                      "rateLimits": {"limitId": "codex", "primary": {"usedPercent": 15},
+                                     "secondary": {"usedPercent": 35}}}
+        with patch.object(adapter, "_ensure_started"), patch.object(
+                adapter, "_rpc", return_value={"result": fresh_read}):
+            self.assertEqual(adapter.read_rate_limits(), fresh_read)
+        recovered = QuotaSnapshot.parse(adapter._rate_limits)
+        self.assertEqual(recovered.availability, QuotaAvailability.AVAILABLE)
+        self.assertEqual(recovered.confidence, "server_confirmed")
 
     def test_turn_completed_after_turn_start_rpc_is_delivered(self):
         adapter = CodexAppServerAdapter(workspace_root=".")

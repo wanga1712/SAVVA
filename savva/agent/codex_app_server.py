@@ -327,6 +327,16 @@ def _merge_rate_limit_update(current: dict[str, Any], update: dict[str, Any]) ->
         merged["rateLimits"] = _merge_non_null(current_bucket, update)
     elif not isinstance(current_bucket, dict):
         merged["rateLimits"] = _merge_non_null({}, update)
+    # A quota notification can overtake the admission bit from a previous full
+    # read. Invalidate that bit only when the newer snapshot confirms exhaustion;
+    # a later full read can then authoritatively restore availability.
+    from .failover import QuotaSnapshot
+    quota_only = dict(merged)
+    quota_only.pop("ordinaryUsageAllowed", None)
+    quota_only.pop("ordinary_usage_allowed", None)
+    if QuotaSnapshot.parse(quota_only).exhausted and (
+            "ordinaryUsageAllowed" in merged or "ordinary_usage_allowed" in merged):
+        merged["ordinaryUsageAllowed"] = None
     return merged
 
 
