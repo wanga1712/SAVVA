@@ -113,6 +113,7 @@ These are proposed contracts for sequential WIPs; names are logical boundaries, 
 
 - `TokenEstimator.count(model, content) -> TokenCount(value, method, confidence)`. Prefer the model tokenizer; otherwise use a conservative documented estimate. Reject a call if the validated context limit plus output reserve and safety margin is exceeded.
 - `ContextPack`: ordered messages/fragments, source refs, per-category token accounting, estimator confidence, omissions/compressions, and trace ids. Context assembly changes only the provider copy; canonical messages and source files remain intact.
+- Context packing order when over budget: remove duplicate references/identical excerpts; compress older conversation into a versioned summary while preserving originals; retrieve only the task-relevant memory/document/source spans; for large inputs, perform staged local extraction/summarization with source refs; finally evaluate a compatible model with a larger verified context. If no safe plan fits system instructions + tools + input + output reserve + margin, return BLOCKED before transport. Record before/after token estimates, every omitted/compressed source, reason, and estimator method in the trace.
 - `MemoryRecord`: `record_id`, `owner_scope` (`user`, `project`, `agent`, `conversation`), `owner_id`, `kind` (`fact`, `hypothesis`, `decision`, `preference`, `experience`), content/ref, source, valid time, captured time, verification status, confidence, version, sensitivity, retention, and supersedes relation.
 - Memory reads require an explicit user/project/agent scope. No search can return records from another owner. Project memory can be shared only through an explicit project membership grant.
 
@@ -144,6 +145,37 @@ These are proposed contracts for sequential WIPs; names are logical boundaries, 
 - Keep large originals outside SQLite in an ACL-confined, content-addressed vault. DB records store opaque relative keys, size, MIME, hash, retention and scan status; no absolute host paths in model context.
 - FTS5 indexes normalized text/chunks with owner/project filters. Index deletion follows source deletion. Future vector search implements the same `Retriever` interface and access filters.
 - Migrations are additive and reversible where possible. Before any format cutover, snapshot existing JSON/JSONL, migrate to a temporary DB, verify record counts/hashes, then atomically switch with rollback instructions. Do not remove old files until a restore rehearsal passes.
+
+### Proposed logical schema and key relationships
+
+The first schema remains a proposal pending identity and retention decisions. The names below retain the requested entities; implementation may add normalized support tables, but must not collapse independent scopes into one generic transcript blob.
+
+| Entity | Ownership / relationships |
+| --- | --- |
+| `models` | Provider/model/version identity and configuration reference; no secret values |
+| `agents` | Agent identity, implementation/prompt version, lifecycle |
+| `agent_roles` | Role-to-agent/model assignment with capability constraints and validity interval |
+| `projects` | User-owned project root reference, policy, budget/resource limits; parent project optional |
+| `conversations` | User-owned; optional project, one or more task references |
+| `messages` | Conversation ordered append-only records; original content retention follows user policy |
+| `memory_records` | Owner scope (`user/project/agent/conversation`), source refs, type, verification and lifecycle |
+| `memory_summaries` | Derived, versioned summary scoped to owner and source message/memory range |
+| `documents` | User/project owner, opaque vault key, content hash, retention and ingestion state |
+| `document_versions` | Immutable content hash, extractor/version and document metadata |
+| `document_chunks` | Versioned text/structure with page/sheet/range/slide/line source location; FTS5 external-content index |
+| `tool_calls` | Task/conversation, actor role, tool/version, validated args hash, approval ref, result/evidence ref |
+| `agent_evaluations` | Evaluator and target agent/task, rubric version, evidence refs, adjudication state |
+| `reputation_events` | Append-only adjudicated event referencing evaluation/task; never grants permissions |
+| `tasks` | Project/conversation refs, workflow state, attempt and budget counters, idempotency key |
+| `wip_records` | Task/project, branch/base SHA, current patch hash, approval and acceptance state |
+| `artifacts` | Project/task, format, content hash, vault key, generation/validation evidence |
+| `approval_events` | Actor, exact project/path/content hash, decision and timestamp; immutable decision history |
+
+Every user-owned table has `user_id`; project-scoped records also have `project_id` and foreign keys. Project membership/grants are validated by service/repository methods. FTS rows inherit owner/project scope from the indexed `document_chunks` or memory source and are joined through filtered queries; FTS itself is never an authorization boundary. Deletion traverses dependent summaries, chunks/index rows, artifacts and references according to the approved retention policy, while preserving only audit records explicitly required by that policy.
+
+### Project and workspace contract
+
+`ProjectService` remains the current approval/workspace boundary. The target `ProjectRepository` owns project identity, parent-child relationships, registered root, grants, enabled tools, assigned agents/roles, budget/resource caps, WIP/task history, and architecture/decision refs. Filesystem paths are resolved by the workspace service against a registered root on every operation. Separate directions such as School subjects and waterproofing are ordinary isolated projects and may define their own subprojects and role sets. React and Streamlit clients, if introduced, consume the same Core API; neither UI owns domain state or access checks.
 
 ## 6. Security, privacy, and governance invariants
 
@@ -219,6 +251,8 @@ Sequential WIP plans and acceptance criteria are in:
 - [SAVVA-004E — Reputation & Governance](../wip/SAVVA-004E-REPUTATION-GOVERNANCE.md)
 - [SAVVA-004F — Artifact Generation](../wip/SAVVA-004F-ARTIFACT-GENERATION.md)
 - [SAVVA-004G — Controlled Execution Engine](../wip/SAVVA-004G-CONTROLLED-EXECUTION.md)
+
+The single index of decisions, ownership, and WIP dependencies is the [Architecture Register](ARCHITECTURE-REGISTER.md).
 
 ## 11. Acceptance status
 
