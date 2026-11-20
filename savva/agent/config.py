@@ -165,7 +165,7 @@ class SettingsStore:
                 current = self._settings.to_public_dict()
                 current.update(
                     {
-                        key: value
+                        key: _coerce_setting(key, value)
                         for key, value in document.items()
                         if key in current
                     }
@@ -262,9 +262,14 @@ def _coerce_setting(key: str, value: Any) -> Any:
         "max_request_cost_usd",
         "max_session_cost_usd",
         "max_duration_seconds",
+        "failover_daily_budget_usd",
     }:
         return float(value)
     if key == "require_tailscale_exit_node":
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+    if key == "failover_enabled":
         if isinstance(value, bool):
             return value
         return str(value).strip().lower() in {"1", "true", "yes", "on"}

@@ -408,12 +408,25 @@ class WorkspaceAndSettingsTests(unittest.TestCase):
                     "max_tokens": "1024",
                     "max_tool_steps": "4",
                     "max_request_cost_usd": "0.01",
+                    "failover_daily_budget_usd": "2.5",
+                    "failover_enabled": "false",
                 }
             )
             public = updated.to_public_dict()
+            reloaded = SettingsStore(settings, root / "settings.json")
+            reloaded.load()
+            legacy = json.loads((root / "settings.json").read_text(encoding="utf-8"))
+            legacy["failover_enabled"] = "True"
+            (root / "settings.json").write_text(json.dumps(legacy), encoding="utf-8")
+            legacy_reloaded = SettingsStore(settings, root / "settings.json")
+            legacy_reloaded.load()
 
         self.assertEqual(updated.max_tokens, 1024)
         self.assertEqual(updated.max_tool_steps, 4)
+        self.assertEqual(updated.failover_daily_budget_usd, 2.5)
+        self.assertIs(updated.failover_enabled, False)
+        self.assertIs(reloaded.get().failover_enabled, False)
+        self.assertIs(legacy_reloaded.get().failover_enabled, True)
         self.assertNotIn("api_key", public)
         self.assertNotIn("OPENROUTER_API_KEY", public)
 

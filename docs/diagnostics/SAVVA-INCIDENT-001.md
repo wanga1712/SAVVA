@@ -84,3 +84,28 @@ These steps reproduce the error-handling and routing mechanisms without consumin
 - **Tailscale as cause:** not supported by current evidence. Current configured exit node is online and matches expected name, but historical route state is unavailable.
 
 No source code was changed during this phase. Fixes belong to the new `wip/SAVVA-EMERGENCY-001` branch based on FAILOVER-003; architecture and other WIP branches are not merged.
+
+## Hotfix restore-service verification — 2026-11-21
+
+**Branch/base:** `wip/SAVVA-EMERGENCY-001`, based on `0de04cefa4685633f2c3cff5c1b4119a2dcd3b67`.
+
+### Confirmed settings defects and repair
+
+- `SettingsStore._coerce_setting()` converted `failover_daily_budget_usd` to a string. Settings validation then raised `TypeError: '<=' not supported between instances of 'int' and 'str'`, which the HTTP handler masked as `500 INTERNAL_ERROR`.
+- `failover_enabled` was also converted to the string `"False"`; because non-empty strings are truthy, disabling failover left Codex selected. Persisted legacy strings were not normalized on load.
+- The hotfix normalizes both types on update and load. Regression tests cover numeric input, boolean toggling, persistence, and legacy settings.
+
+### Live checks
+
+- Main backend started from this checkout on loopback port 8765. `/api/health` and `/api/settings` returned successfully; UI and `/app.js` returned HTTP 200.
+- A short request through SAVVA completed with provider `codex_chatgpt`, actual App Server model `gpt-6-luna`, and answer `SAVVA-CODEX-E2E-OK.`.
+- Current Tailscale route gate passed. DNS and TCP 443 to OpenRouter passed; HTTPS `/api/v1/models` returned 200.
+- SAVVA's `/api/openrouter/key-status` returned authenticated, source `windows_dpapi`, and `is_management_key=false`. The service exposed no key value. The API returned null for limit and remaining balance.
+- The configured model catalog entry `nvidia/nemotron-3.5-lightning:free` reported prompt/completion price 0. One short chat through SAVVA returned `SAVVA-OPENROUTER-E2E-OK`; SAVVA recorded cost `$0.00`. The original `failover_enabled=true` setting was restored and verified.
+- With the main backend stopped, `python -m savva.emergency doctor` independently reported backend unavailable, Codex authenticated/quota available, OpenRouter authenticated via DPAPI, local Ollama missing, and Tailscale ready. The main backend was restarted afterward.
+
+### Acceptance still blocked
+
+- Codex was available during the live run, so no genuine Codex failure occurred. A real automatic Codex-to-OpenRouter transition was not forced; the existing mock failover tests cover the classified auth/disconnection routes.
+- Interactive browser verification was not completed. The installed browser automation launcher was rejected by the command policy, and no screen automation was used. HTTP delivery and direct SAVVA chat routes were verified, but the browser display of the actual provider has not been confirmed.
+- Therefore this hotfix restores both provider routes at API level, but WIP acceptance remains `BLOCKED` until interactive browser acceptance and real automatic failover acceptance are completed.
