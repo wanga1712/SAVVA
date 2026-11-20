@@ -23,10 +23,13 @@ from .agent.config import (
     default_usage_log_path,
     settings_from_environment,
 )
+from .agent.credentials import SecretStore, SecretStoreError, WindowsDPAPISecretStore
+from .agent.openrouter_account import OpenRouterAccountClient, OpenRouterAccountError
 from .agent.models import ModelAdapterError, OllamaAdapter, OpenRouterAdapter
 from .agent.codex_app_server import CodexAppServerAdapter
 from .agent.failover import FailoverEngine, FailoverState
 from .agent.network import TailscaleExitStatus, TailscaleInspector
+from .agent.recovery import RecoveryController
 from .agent.orchestrator import AgentOrchestrator, AgentRuntimeError
 from .agent.projects import ActionJournal, ProjectService
 from .agent.tools import build_agent_registry
@@ -129,6 +132,8 @@ class AppRuntime:
         usage_path: Path | None = None,
         action_log_path: Path | None = None,
         tailscale_inspector: TailscaleInspector | None = None,
+        secret_store: SecretStore | None = None,
+        openrouter_account: OpenRouterAccountClient | None = None,
     ):
         self.project_root = project_root or Path(__file__).resolve().parent.parent
         try:
@@ -141,11 +146,14 @@ class AppRuntime:
         self.settings_store = SettingsStore(settings, settings_path)
         self.settings_store.load()
         self.usage_path = usage_path or default_usage_log_path()
+        self.recovery = RecoveryController(self.usage_path.with_name("recovery.jsonl"))
         self.usage_logger = UsageLogger(self.usage_path)
         self.action_journal = ActionJournal(
             action_log_path or self.usage_path.with_name("actions.jsonl")
         )
         self.sessions = SessionStore(path=self.usage_path.with_name("sessions.json"))
+        self.secret_store = secret_store or WindowsDPAPISecretStore()
+        self.openrouter_account = openrouter_account or OpenRouterAccountClient()
         self.tailscale_inspector = tailscale_inspector or TailscaleInspector()
         self._project_services: dict[str, ProjectService] = {}
         self._project_services_lock = threading.Lock()
@@ -174,13 +182,24 @@ class AppRuntime:
         if self.settings().provider != "openrouter":
             return None
         value = os.environ.get("OPENROUTER_API_KEY", "").strip()
-        return value or None
+        return value or self.secret_store.get()
 
     def public_settings(self) -> dict[str, Any]:
         result = self.settings().to_public_dict()
         result["api_key_configured"] = self.api_key() is not None
-        result["api_key_source"] = "OPENROUTER_API_KEY"
+        result["api_key_source"] = (
+            "OPENROUTER_API_KEY" if os.environ.get("OPENROUTER_API_KEY", "").strip()
+            else "windows_dpapi" if result["api_key_configured"] else None
+        )
         return result
+
+    def openrouter_key_status(self) -> dict[str, Any]:
+        key = os.environ.get("OPENROUTER_API_KEY", "").strip() or self.secret_store.get()
+        if not key:
+            return {"configured": False, "authenticated": False, "source": None}
+        status = self.openrouter_account.key_status(key)
+        status.update({"configured": True, "source": "environment" if os.environ.get("OPENROUTER_API_KEY", "").strip() else "windows_dpapi"})
+        return status
 
     def tools(self) -> list[dict[str, Any]]:
         root = self.settings().workspace_root
@@ -272,7 +291,12 @@ class AppRuntime:
                 last_operation_id=operation_id, last_result=response,
             ))
             return response
-        except (AgentRuntimeError, ModelAdapterError, BudgetExceeded):
+        except (AgentRuntimeError, ModelAdapterError, BudgetExceeded) as exc:
+            self.recovery.record(
+                operation_id=operation_id, provider=adapter.provider, model=adapter.model,
+                error=exc,
+                tailscale_ready=(egress.ready if settings.require_tailscale_exit_node else None),
+            )
             self.sessions.set(session_id, SessionState(
                 **{**asdict(previous), "failover_state": adapter.state.value,
                    "fallback_reason": adapter.fallback_reason,
@@ -373,6 +397,9 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/settings":
                 self._json(HTTPStatus.OK, self.server.runtime.public_settings())
                 return
+            if path == "/api/openrouter/key-status":
+                self._json(HTTPStatus.OK, self.server.runtime.openrouter_key_status())
+                return
             if path == "/api/tools":
                 self._json(
                     HTTPStatus.OK,
@@ -387,6 +414,9 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
                         "tailscale": self.server.runtime.tailscale_status().to_dict(),
                     },
                 )
+                return
+            if path == "/api/recovery":
+                self._json(HTTPStatus.OK, {"status": "success", "events": self.server.runtime.recovery.recent()})
                 return
             if path == "/api/projects/tree":
                 query = parse_qs(urlparse(self.path).query)
@@ -435,6 +465,8 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
                 self._static("styles.css", "text/css; charset=utf-8")
                 return
             self._error(HTTPStatus.NOT_FOUND, "NOT_FOUND", "Resource not found.")
+        except (OpenRouterAccountError, SecretStoreError) as exc:
+            self._error(HTTPStatus.BAD_GATEWAY, exc.code, exc.safe_message)
         except Exception:
             self._error(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -446,10 +478,21 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             body = self._read_json()
+            if path == "/api/openrouter/key":
+                value = body.get("api_key")
+                if not isinstance(value, str):
+                    self._error(HTTPStatus.BAD_REQUEST, "API_KEY_INVALID", "Enter a valid OpenRouter API key.")
+                    return
+                self.server.runtime.secret_store.set(value)
+                self._json(HTTPStatus.OK, {"status": "success", "configured": True, "source": "windows_dpapi"})
+                return
+            if path == "/api/openrouter/key/delete":
+                self.server.runtime.secret_store.delete()
+                self._json(HTTPStatus.OK, {"status": "success", "configured": bool(os.environ.get("OPENROUTER_API_KEY", "").strip())})
+                return
             if path == "/api/settings":
-                settings = self.server.runtime.settings_store.update(body)
-                public = settings.to_public_dict()
-                public["api_key_configured"] = self.server.runtime.api_key() is not None
+                self.server.runtime.settings_store.update(body)
+                public = self.server.runtime.public_settings()
                 self._json(HTTPStatus.OK, {"status": "success", "settings": public})
                 return
             if path == "/api/chat":
@@ -540,6 +583,10 @@ class SavvaRequestHandler(BaseHTTPRequestHandler):
             )
         except SettingsError as exc:
             self._error(HTTPStatus.BAD_REQUEST, exc.code, exc.safe_message)
+        except SecretStoreError as exc:
+            self._error(HTTPStatus.BAD_REQUEST, exc.code, exc.safe_message)
+        except OpenRouterAccountError as exc:
+            self._error(HTTPStatus.BAD_GATEWAY, exc.code, exc.safe_message)
         except PermissionError as exc:
             self._error(HTTPStatus.FORBIDDEN, "ORIGIN_DENIED", str(exc))
         except (AgentRuntimeError, ModelAdapterError) as exc:

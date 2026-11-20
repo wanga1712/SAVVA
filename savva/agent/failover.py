@@ -176,11 +176,17 @@ class FailoverEngine(ModelAdapter):
                                            tool_choice=tool_choice)
         except ModelAdapterError as exc:
             snapshot = self._quota_from_error(exc)
-            if exc.failure_kind != "quota" or not snapshot.exhausted:
-                self.state = FailoverState.BLOCKED if exc.failure_kind in {"auth", "config"} else self.state
-                raise
-            self._activate_fallback(snapshot, exc.code)
-            return self._fallback(messages, tools, max_tokens, timeout_seconds, tool_choice)
+            if exc.failure_kind == "quota" and snapshot.exhausted:
+                self._activate_fallback(snapshot, exc.code)
+                return self._fallback(messages, tools, max_tokens, timeout_seconds, tool_choice)
+            if self.primary.provider == "codex_chatgpt" and exc.failure_kind in {"auth", "transient"}:
+                # A confirmed primary auth failure or disconnected transport can
+                # use the separately budgeted fallback. Do not persist BLOCKED:
+                # a repaired credential/network must be probed on a later turn.
+                reason = "primary_auth_failed" if exc.failure_kind == "auth" else "primary_disconnected"
+                self._activate_fallback(snapshot, reason)
+                return self._fallback(messages, tools, max_tokens, timeout_seconds, tool_choice)
+            raise
         self.state = FailoverState.PRIMARY_RECOVERED if recovered else FailoverState.PRIMARY_ACTIVE
         self.provider, self.model = self.primary.provider, self.primary.model
         return result

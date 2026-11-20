@@ -17,3 +17,5 @@ secrets.*
 sessions.json
 usage.jsonl
 actions.jsonl
+recovery.jsonl
+*.dpapi

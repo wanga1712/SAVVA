@@ -23,6 +23,29 @@ class FakeTailscaleInspector:
         return self.status
 
 
+class FakeSecretStore:
+    def __init__(self):
+        self.value = None
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value.strip()
+
+    def delete(self):
+        self.value = None
+
+
+class FakeOpenRouterAccount:
+    def key_status(self, api_key):
+        if api_key != "test-openrouter-key":
+            raise AssertionError("Unexpected key passed to test account client")
+        return {"authenticated": True, "limit": 5, "limit_remaining": 4.5,
+                "usage": 0.5, "usage_daily": None, "usage_weekly": None,
+                "usage_monthly": None, "limit_reset": None, "is_management_key": False}
+
+
 class ServerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -50,12 +73,15 @@ class ServerTests(unittest.TestCase):
                 ready=True,
             )
         )
+        self.secret_store = FakeSecretStore()
         self.server.runtime = AppRuntime(
             project_root=root,
             settings_path=root / "settings.json",
             usage_path=root / "usage.jsonl",
             action_log_path=root / "actions.jsonl",
             tailscale_inspector=self.tailscale,
+            secret_store=self.secret_store,
+            openrouter_account=FakeOpenRouterAccount(),
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -81,6 +107,47 @@ class ServerTests(unittest.TestCase):
         self.assertNotIn("OPENROUTER_API_KEY=", json.dumps(health))
         self.assertIn("default-src 'self'", csp)
         self.assertIn("SAVVA Agent", html)
+
+    def test_openrouter_key_is_saved_persistently_and_never_returned(self) -> None:
+        key = "test-openrouter-key"
+        request = urllib.request.Request(
+            self.base_url + "/api/openrouter/key",
+            data=json.dumps({"api_key": key}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-SAVVA-Request": "1"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            saved = json.loads(response.read().decode("utf-8"))
+        self.assertTrue(saved["configured"])
+        self.assertNotIn(key, json.dumps(saved))
+
+        settings = self.server.runtime.public_settings()
+        self.assertTrue(settings["api_key_configured"])
+        self.assertEqual(settings["api_key_source"], "windows_dpapi")
+        self.assertNotIn(key, json.dumps(settings))
+
+        root = Path(self.temporary.name)
+        restarted = AppRuntime(
+            project_root=root, settings_path=root / "settings.json",
+            usage_path=root / "usage.jsonl", action_log_path=root / "actions.jsonl",
+            tailscale_inspector=self.tailscale, secret_store=self.secret_store,
+            openrouter_account=FakeOpenRouterAccount(),
+        )
+        self.assertEqual(restarted.api_key(), key)
+        status = restarted.openrouter_key_status()
+        self.assertTrue(status["authenticated"])
+        self.assertEqual(status["limit_remaining"], 4.5)
+        self.assertNotIn(key, json.dumps(status))
+
+        delete = urllib.request.Request(
+            self.base_url + "/api/openrouter/key/delete", data=b"{}",
+            headers={"Content-Type": "application/json", "X-SAVVA-Request": "1"},
+            method="POST",
+        )
+        with urllib.request.urlopen(delete, timeout=5) as response:
+            deleted = json.loads(response.read().decode("utf-8"))
+        self.assertFalse(deleted["configured"])
+        self.assertIsNone(self.server.runtime.api_key())
 
     def test_chat_without_backend_key_returns_safe_error(self) -> None:
         request = urllib.request.Request(

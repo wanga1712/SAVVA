@@ -67,15 +67,27 @@ class FailoverTests(unittest.TestCase):
         self.assertEqual(engine.state, FailoverState.PRIMARY_RECOVERED)
         self.assertEqual(primary.messages[0], resumed_context)
 
-    def test_auth_timeout_and_overload_do_not_switch(self):
-        for kind in ("auth", "transient"):
+    def test_primary_auth_or_disconnection_switches_to_budgeted_fallback(self):
+        for kind, reason in (("auth", "primary_auth_failed"),
+                             ("transient", "primary_disconnected")):
             with self.subTest(kind=kind):
                 primary = FakeAdapter("codex_chatgpt", "gpt", limits=limits(),
                                       error=ModelAdapterError("NO", "safe", failure_kind=kind))
                 fallback = FakeAdapter("openrouter", "backup")
-                with self.assertRaises(ModelAdapterError):
-                    FailoverEngine(primary, fallback).complete([], [], max_tokens=32, timeout_seconds=1)
-                self.assertEqual(fallback.calls, 0)
+                engine = FailoverEngine(primary, fallback)
+                engine.complete([], [], max_tokens=32, timeout_seconds=1)
+                self.assertEqual(primary.calls, 1)
+                self.assertEqual(fallback.calls, 1)
+                self.assertEqual(engine.state, FailoverState.FALLBACK_ACTIVE)
+                self.assertEqual(engine.fallback_reason, reason)
+
+    def test_overload_does_not_use_fallback_without_explicit_route_policy(self):
+        primary = FakeAdapter("codex_chatgpt", "gpt", limits=limits(),
+                              error=ModelAdapterError("NO", "safe", failure_kind="overload"))
+        fallback = FakeAdapter("openrouter", "backup")
+        with self.assertRaises(ModelAdapterError):
+            FailoverEngine(primary, fallback).complete([], [], max_tokens=32, timeout_seconds=1)
+        self.assertEqual(fallback.calls, 0)
 
     def test_fallback_budget_blocks_next_paid_call(self):
         primary = FakeAdapter("codex_chatgpt", "gpt", limits=limits(100, 100))

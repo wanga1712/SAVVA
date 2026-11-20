@@ -40,13 +40,20 @@ const elements = {
 };
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    headers: {
-      "Content-Type": "application/json",
-      "X-SAVVA-Request": "1",
-    },
-    ...options,
-  });
+  let response;
+  try {
+    response = await fetch(path, {
+      headers: {
+        "Content-Type": "application/json",
+        "X-SAVVA-Request": "1",
+      },
+      ...options,
+    });
+  } catch {
+    const error = new Error("SAVVA backend is unreachable. Start it again or run `python -m savva.emergency serve` for diagnostics.");
+    error.code = "BACKEND_UNAVAILABLE";
+    throw error;
+  }
   const document = await response.json().catch(() => ({}));
   if (!response.ok) {
     const error = new Error(document.error?.message || `HTTP ${response.status}`);
@@ -610,7 +617,7 @@ async function sendMessage(text) {
     shell.thinking.remove();
     const answer = document.createElement("div");
     answer.className = "answer";
-    answer.textContent = `${error.code}: ${error.message}`;
+    answer.textContent = `${error.code || "REQUEST_FAILED"}: ${error.message}`;
     shell.body.append(answer);
   } finally {
     state.busy = false;
@@ -632,9 +639,54 @@ function applySettings(settings) {
   }
   elements.keyStatus.textContent =
     settings.provider === "openrouter"
-      ? (settings.api_key_configured ? "Key is configured in backend." : "Key is missing in backend.")
+      ? (settings.api_key_configured ? `Key is saved (${settings.api_key_source || "environment"}); value hidden.` : "No key is saved.")
       : "Ollama does not use an API key.";
 }
+
+document.querySelector("#save-api-key").addEventListener("click", async () => {
+  const input = document.querySelector("#openrouter-api-key");
+  elements.settingsError.textContent = "";
+  try {
+    await api("/api/openrouter/key", { method: "POST", body: JSON.stringify({ api_key: input.value }) });
+    input.value = "";
+    elements.keyStatus.textContent = "Key saved encrypted for this Windows user. Use Check key / limits to verify authorization.";
+    const settings = await api("/api/settings");
+    applySettings(settings);
+    elements.keyStatus.textContent = "Key saved encrypted for this Windows user. Authorization not checked yet.";
+  } catch (error) {
+    elements.settingsError.textContent = `${error.code || "REQUEST_FAILED"}: ${error.message}`;
+  }
+});
+
+document.querySelector("#check-api-key").addEventListener("click", async () => {
+  elements.settingsError.textContent = "";
+  elements.keyStatus.textContent = "Checking OpenRouter authorization and key limits…";
+  try {
+    const result = await api("/api/openrouter/key-status");
+    if (!result.configured) {
+      elements.keyStatus.textContent = "No key is saved.";
+      return;
+    }
+    const limit = result.limit === null ? "unknown" : `$${result.limit}`;
+    const remaining = result.limit_remaining === null ? "unknown" : `$${result.limit_remaining}`;
+    elements.keyStatus.textContent = `Authorized (${result.source}). Limit: ${limit}; remaining: ${remaining}.`;
+  } catch (error) {
+    elements.keyStatus.textContent = "Key status check failed.";
+    elements.settingsError.textContent = `${error.code || "REQUEST_FAILED"}: ${error.message}`;
+  }
+});
+
+document.querySelector("#delete-api-key").addEventListener("click", async () => {
+  if (!window.confirm("Delete the encrypted OpenRouter key saved for this Windows user?")) return;
+  elements.settingsError.textContent = "";
+  try {
+    await api("/api/openrouter/key/delete", { method: "POST", body: "{}" });
+    elements.keyStatus.textContent = "Saved key deleted. An environment key, if set, remains active.";
+    applySettings(await api("/api/settings"));
+  } catch (error) {
+    elements.settingsError.textContent = `${error.code || "REQUEST_FAILED"}: ${error.message}`;
+  }
+});
 
 async function saveSettings() {
   elements.settingsError.textContent = "";
