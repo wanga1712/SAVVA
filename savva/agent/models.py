@@ -27,6 +27,7 @@ class ModelUsage:
     completion_tokens: int = 0
     total_tokens: int = 0
     cost_usd: float = 0.0
+    cost_verified: bool = False
 
 
 @dataclass(slots=True)
@@ -263,6 +264,11 @@ class OpenAICompatibleAdapter(ModelAdapter):
             completion_tokens=int(usage_document.get("completion_tokens") or 0),
             total_tokens=int(usage_document.get("total_tokens") or 0),
             cost_usd=float(usage_document.get("cost") or 0.0),
+            cost_verified=(
+                isinstance(usage_document.get("cost"), (int, float))
+                and not isinstance(usage_document.get("cost"), bool)
+                and float(usage_document.get("cost")) >= 0
+            ),
         )
         return ModelResponse(
             content=str(content or "").strip(),

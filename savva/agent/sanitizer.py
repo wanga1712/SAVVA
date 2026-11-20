@@ -43,12 +43,6 @@ UNSAFE_ANSWER_LINE = re.compile(
     r"\bоткр\w*|\bприступ\w*|\bподключ\w*|"
     r"что можно сделать|следующий шаг)"
 )
-READ_ONLY_FOOTER = (
-    "Режим только чтения: файлы и пакеты не изменялись. Безопасный следующий "
-    "шаг — согласовать имя проекта и шаблон; создание или установка компонентов "
-    "потребуют отдельного подтверждения в будущем write-разрешении."
-)
-
 
 def redact_text(value: str, workspace_root: str | Path | None = None) -> str:
     text = str(value)
@@ -107,6 +101,4 @@ def constrain_read_only_answer(answer: str) -> str:
             continue
         kept.append(line)
     cleaned = "\n".join(kept).strip()
-    if not cleaned:
-        cleaned = "Диагностика завершена."
-    return cleaned + "\n\n" + READ_ONLY_FOOTER
+    return cleaned

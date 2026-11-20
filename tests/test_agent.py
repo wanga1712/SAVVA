@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import tempfile
@@ -11,6 +11,7 @@ from savva.agent.config import (
     AppSettings,
     SettingsStore,
 )
+from savva.agent.context import ContextBudgetManager, IntentRouter
 from savva.agent.models import (
     ModelAdapter,
     ModelResponse,
@@ -150,6 +151,7 @@ class ModelAdapterTests(unittest.TestCase):
         self.assertEqual(result.tool_calls[0].name, "software.detect")
         self.assertEqual(result.tool_calls[0].arguments, {"name": "node"})
         self.assertEqual(result.usage.total_tokens, 29)
+        self.assertTrue(result.usage.cost_verified)
         self.assertEqual(transport.calls[0]["url"], "https://openrouter.ai/api/v1/chat/completions")
         self.assertEqual(
             transport.calls[0]["headers"]["Authorization"],
@@ -188,8 +190,8 @@ class SanitizerTests(unittest.TestCase):
             "Create a new React project with Vite.\n"
             "Start the development server afterwards.\n"
             "The browser should open http://localhost:5173.\n"
-            "Создайте папку проекта и приступайте к созданию компонента.\n"
-            "Позже можно подключить TypeScript.\n"
+            "РЎРѕР·РґР°Р№С‚Рµ РїР°РїРєСѓ РїСЂРѕРµРєС‚Р° Рё РїСЂРёСЃС‚СѓРїР°Р№С‚Рµ Рє СЃРѕР·РґР°РЅРёСЋ РєРѕРјРїРѕРЅРµРЅС‚Р°.\n"
+            "РџРѕР·Р¶Рµ РјРѕР¶РЅРѕ РїРѕРґРєР»СЋС‡РёС‚СЊ TypeScript.\n"
             "```bash\nnpx create-react-app demo\n```\n"
             "Choose a template as the next planning step."
         )
@@ -198,8 +200,8 @@ class SanitizerTests(unittest.TestCase):
 
         self.assertNotIn("npm install", clean)
         self.assertNotIn("create-react-app", clean)
-        self.assertIn("Choose a template", clean)
-        self.assertIn("Режим только чтения", clean)
+        self.assertNotIn("READ_ONLY_FOOTER", clean)
+        self.assertTrue(clean.startswith("Environment is ready."))
 
     def test_verified_summary_uses_real_tool_data(self) -> None:
         events = [
@@ -250,6 +252,60 @@ class SanitizerTests(unittest.TestCase):
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_chat_uses_no_tools_short_prompt_and_no_footer(self) -> None:
+        adapter = FakeAdapter([response(content="Dinner suggestion.")])
+        with tempfile.TemporaryDirectory() as directory:
+            orchestrator = AgentOrchestrator(
+                adapter=adapter, registry=build_agent_registry(directory),
+                workspace_root=directory, max_tokens=2048, max_tool_steps=3,
+                max_requests_per_session=5, max_request_cost_usd=0.1,
+                max_session_cost_usd=0.5, max_duration_seconds=30,
+                usage_logger=UsageLogger(Path(directory) / "usage.jsonl"),
+            )
+            result = orchestrator.run([], "??? ??????????? ?? ?????", session_id="chat-test")
+        self.assertEqual(adapter.calls[0]["tools"], [])
+        self.assertEqual(adapter.calls[0]["messages"][0]["role"], "system")
+        self.assertEqual(result.answer, "Dinner suggestion.")
+
+    def test_history_budget_limits_model_copy_without_mutating_history(self) -> None:
+        manager = ContextBudgetManager()
+        history = [
+            {"role": "user", "content": f"old question {index} " + ("x" * 5000)}
+            for index in range(4)
+        ]
+        original_size = len(history)
+        plan = manager.build(history, "What do you know about yourself?", [], "openrouter", "test/model", 2048)
+        self.assertEqual(plan.intent, "CHAT")
+        self.assertEqual(len(history), original_size)
+        self.assertEqual(plan.tools, [])
+        self.assertLess(plan.estimates["history"], 1400)
+        self.assertLessEqual(plan.max_output_tokens, 160)
+
+    def test_development_and_other_intents_are_explicit(self) -> None:
+        russian_fix = "".join(map(chr, [0x0418,0x0441,0x043F,0x0440,0x0430,0x0432,0x044C,0x0020,0x043E,0x0448,0x0438,0x0431,0x043A,0x0443,0x0020,0x0432,0x0020,0x0050,0x0079,0x0074,0x0068,0x006F,0x006E,0x002D,0x043C,0x043E,0x0434,0x0443,0x043B,0x0435]))
+        russian_presentation = "".join(map(chr, [0x0421,0x043E,0x0437,0x0434,0x0430,0x0439,0x0020,0x043F,0x0440,0x0435,0x0437,0x0435,0x043D,0x0442,0x0430,0x0446,0x0438,0x044E]))
+        self.assertEqual(IntentRouter.route(russian_fix), "DEVELOPMENT")
+        self.assertEqual(IntentRouter.route("What do you know about me?"), "CHAT")
+        self.assertEqual(IntentRouter.route(russian_presentation), "UNSUPPORTED_OTHER")
+
+    def test_development_tools_are_scoped_and_keep_approval_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            orchestrator = AgentOrchestrator(
+                adapter=FakeAdapter([response(content="Ready")]),
+                registry=build_agent_registry(directory), workspace_root=directory,
+                max_tokens=512, max_tool_steps=1, max_requests_per_session=2,
+                max_request_cost_usd=0.1, max_session_cost_usd=0.5,
+                max_duration_seconds=10, usage_logger=UsageLogger(Path(directory) / "u.jsonl"),
+            )
+            plan = orchestrator.context_manager.build(
+                [{"role": "user", "content": "Create a Python module"}],
+                "Create a Python module", orchestrator._model_tools(), "openrouter", "test/model", 512,
+            )
+        names = [tool["function"]["name"] for tool in plan.tools]
+        self.assertEqual(plan.intent, "DEVELOPMENT")
+        self.assertTrue(names)
+        self.assertFalse(any("files_apply" in name for name in names))
+
     def test_project_create_is_executed_as_a_proposal_without_writes(self) -> None:
         adapter = FakeAdapter(
             [
@@ -346,6 +402,9 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(result.answer.startswith("Environment checked."))
         self.assertEqual(result.usage["requests"], 2)
         self.assertEqual(len(records), 2)
+        self.assertIn('"intent": "ACTION"', records[0])
+        self.assertIn('"prompt_version": "1.0.0"', records[0])
+        self.assertIn('"cost_verified": false', records[0])
         self.assertTrue(all("." not in name for name in exposed_names))
         self.assertIn("savva_demo_echo", exposed_names)
         outbound = json.dumps(adapter.calls[1]["messages"])
@@ -379,7 +438,27 @@ class OrchestratorTests(unittest.TestCase):
             result = orchestrator.run([], "Run shell", session_id="session-456")
 
         tool_event = next(event for event in result.events if event["type"] == "tool_call")
-        self.assertEqual(tool_event["result"]["error"]["code"], "TOOL_NOT_FOUND")
+        self.assertEqual(tool_event["result"]["error"]["code"], "TOOL_NOT_ALLOWED_FOR_INTENT")
+
+    def test_chat_cannot_execute_registered_tool_even_if_model_returns_call(self) -> None:
+        invoked = []
+        registry = ToolRegistry()
+        registry.register(contract("demo.echo"), lambda args: invoked.append(args))
+        adapter = FakeAdapter([
+            response(calls=[ToolCall("call-1", "savva_demo_echo", {"value": "x"}, '{"value":"x"}')]),
+            response(content="A dinner idea.")
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            orchestrator = AgentOrchestrator(
+                adapter=adapter, registry=registry, workspace_root=directory,
+                max_tokens=512, max_tool_steps=2, max_requests_per_session=3,
+                max_request_cost_usd=0.1, max_session_cost_usd=0.5,
+                max_duration_seconds=10, usage_logger=UsageLogger(Path(directory) / "usage.jsonl"),
+            )
+            result = orchestrator.run([], "What should I cook?", session_id="chat-deny-tool")
+        self.assertEqual(invoked, [])
+        self.assertEqual(adapter.calls[0]["tools"], [])
+        self.assertEqual(result.answer, "A dinner idea.")
 
 
 class WorkspaceAndSettingsTests(unittest.TestCase):

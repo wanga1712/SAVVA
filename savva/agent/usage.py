@@ -25,6 +25,19 @@ class UsageRecord:
     duration_ms: int
     status: str
     tool_names: list[str]
+    intent: str = "UNKNOWN"
+    prompt_version: str = "unknown"
+    system_tokens_estimated: int = 0
+    history_tokens_estimated: int = 0
+    tool_schema_tokens_estimated: int = 0
+    memory_tokens_estimated: int = 0
+    document_tokens_estimated: int = 0
+    tool_result_tokens_estimated: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_verified: bool = False
+    breakdown_status: str = "ESTIMATED"
+    tool_calls: int = 0
 
 
 class UsageLogger:
@@ -47,6 +60,18 @@ class UsageLogger:
         duration_ms: int = 0,
         status: str = "success",
         tool_names: list[str] | None = None,
+        intent: str = "UNKNOWN",
+        prompt_version: str = "unknown",
+        system_tokens_estimated: int = 0,
+        history_tokens_estimated: int = 0,
+        tool_schema_tokens_estimated: int = 0,
+        memory_tokens_estimated: int = 0,
+        document_tokens_estimated: int = 0,
+        tool_result_tokens_estimated: int = 0,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cost_verified: bool = False,
+        tool_calls: int = 0,
     ) -> UsageRecord:
         usage = UsageRecord(
             request_id=uuid.uuid4().hex,
@@ -61,6 +86,18 @@ class UsageLogger:
             duration_ms=max(0, int(duration_ms)),
             status=status,
             tool_names=list(tool_names or []),
+            intent=str(intent),
+            prompt_version=str(prompt_version),
+            system_tokens_estimated=max(0, int(system_tokens_estimated)),
+            history_tokens_estimated=max(0, int(history_tokens_estimated)),
+            tool_schema_tokens_estimated=max(0, int(tool_schema_tokens_estimated)),
+            memory_tokens_estimated=max(0, int(memory_tokens_estimated)),
+            document_tokens_estimated=max(0, int(document_tokens_estimated)),
+            tool_result_tokens_estimated=max(0, int(tool_result_tokens_estimated)),
+            input_tokens=max(0, int(input_tokens)),
+            output_tokens=max(0, int(output_tokens)),
+            cost_verified=bool(cost_verified),
+            tool_calls=max(0, int(tool_calls)),
         )
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)

@@ -17,4 +17,4 @@ savva = "savva.cli:main"
 include = ["savva*"]
 
 [tool.setuptools.package-data]
-savva = ["web/*.html", "web/*.css", "web/*.js"]
+savva = ["web/*.html", "web/*.css", "web/*.js", "prompts/*.json"]
