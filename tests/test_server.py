@@ -158,6 +158,13 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(catalog["catalog_count"], 1)
         self.assertNotIn("good-test-key", json.dumps(account) + json.dumps(catalog))
 
+    def test_openrouter_discovery_uses_saved_key_independent_of_active_provider(self) -> None:
+        self.server.runtime.secret_store.set("good-test-key")
+        self.server.runtime.settings_store.update({"provider": "ollama"})
+        with urllib.request.urlopen(self.base_url + "/api/openrouter/key-check", timeout=5) as response:
+            account = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(account["key"]["limit_remaining"], 2.75)
+
     def test_management_key_is_rejected_and_bad_auth_is_classified(self) -> None:
         self.server.runtime.secret_store.set("management-test-key")
         with self.assertRaises(urllib.error.HTTPError) as raised:

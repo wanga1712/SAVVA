@@ -103,22 +103,30 @@ class OpenRouterAccountClient:
         if not row:
             return {
                 "provider": "openrouter", "model_id": requested_id,
+                "description": None,
                 "context_length": None, "tool_calling": False,
+                "input_modalities": [], "output_modalities": [],
+                "supported_parameters": [],
                 "structured_output": False, "image_input": False,
                 "input_price": None, "output_price": None,
                 "availability_status": "UNAVAILABLE", "catalog_only": True,
             }
         architecture = row.get("architecture") if isinstance(row.get("architecture"), dict) else {}
         modalities = architecture.get("input_modalities") if isinstance(architecture.get("input_modalities"), list) else []
+        output_modalities = architecture.get("output_modalities") if isinstance(architecture.get("output_modalities"), list) else []
         pricing = row.get("pricing") if isinstance(row.get("pricing"), dict) else {}
         params = row.get("supported_parameters") if isinstance(row.get("supported_parameters"), list) else []
         return {
             "provider": "openrouter",
             "model_id": row.get("id"),
             "name": _safe_string(row.get("name")),
+            "description": _safe_string(row.get("description")),
             "context_length": _safe_number(row.get("context_length")),
             "tool_calling": any(item in params for item in ("tools", "tool_choice")),
             "structured_output": any(item in params for item in ("response_format", "structured_outputs")),
+            "input_modalities": [item for item in modalities if isinstance(item, str)],
+            "output_modalities": [item for item in output_modalities if isinstance(item, str)],
+            "supported_parameters": [item for item in params if isinstance(item, str)],
             "image_input": "image" in modalities,
             "input_price": _safe_number(pricing.get("prompt")),
             "output_price": _safe_number(pricing.get("completion")),

@@ -107,6 +107,9 @@ class AppRuntime:
     def api_key(self) -> str | None:
         if self.settings().provider != "openrouter":
             return None
+        return self.openrouter_api_key()
+
+    def openrouter_api_key(self) -> str | None:
         value = os.environ.get("OPENROUTER_API_KEY", "").strip()
         if value:
             return value
@@ -144,7 +147,7 @@ class AppRuntime:
         return self.api_key_status()
 
     def check_openrouter_key(self) -> dict[str, Any]:
-        key = self.api_key()
+        key = self.openrouter_api_key()
         if key is None:
             raise OpenRouterError("API_KEY_MISSING", "OpenRouter API key is not configured.")
         status = self.openrouter_client.key_status(key)
@@ -156,7 +159,7 @@ class AppRuntime:
         return status
 
     def discover_openrouter_models(self) -> dict[str, Any]:
-        key = self.api_key()
+        key = self.openrouter_api_key()
         if key is None:
             raise OpenRouterError("API_KEY_MISSING", "OpenRouter API key is not configured.")
         return self.openrouter_client.discover_models(key)

@@ -34,8 +34,9 @@ class OpenRouterDiscoveryTests(unittest.TestCase):
         transport = FakeTransport({"data": [
             {
                 "id": "qwen/qwen3-coder-next", "name": "Qwen Coder Next",
+                "description": "Catalog test description",
                 "context_length": 65536,
-                "architecture": {"input_modalities": ["text", "image"]},
+                "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["text"]},
                 "pricing": {"prompt": "0.000001", "completion": "0.000002"},
                 "supported_parameters": ["tools", "response_format"],
             },
@@ -52,6 +53,10 @@ class OpenRouterDiscoveryTests(unittest.TestCase):
         coder = result["models"][0]
         self.assertEqual(coder["model_id"], "qwen/qwen3-coder-next")
         self.assertEqual(coder["availability_status"], "CATALOG_ONLY")
+        self.assertEqual(coder["description"], "Catalog test description")
+        self.assertEqual(coder["input_modalities"], ["text", "image"])
+        self.assertEqual(coder["output_modalities"], ["text"])
+        self.assertIn("response_format", coder["supported_parameters"])
         self.assertTrue(coder["tool_calling"])
         self.assertTrue(coder["structured_output"])
         self.assertTrue(coder["image_input"])
